@@ -92,14 +92,6 @@ class Futoshiki(object):
                 UNKNOWN_STR for _col_zb in range(n)
             ] for _row_zb in range(n)
         ]
-        self.cell_possibilities = [
-            [
-                [
-                    True for _digit_zb in range(n)
-                ] for _col_zb in range(n)
-            ] for _row_zb in range(n)
-        ]
-        # ... index as self.cell_possibilities[row_zb][col_zb][digit_zb]
         self.inequality_right = [
             [
                 None
@@ -242,7 +234,7 @@ class Futoshiki(object):
         x = [
             [
                 [
-                    m.add_var(f"x(row_zb={r}, col={c}, digit={d}",
+                    m.add_var(f"x(row_zb={r}, col_zb={c}, digit_zb={d})",
                               var_type=BINARY)
                     for d in range(n)
                 ] for c in range(n)

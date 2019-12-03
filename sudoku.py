@@ -93,8 +93,8 @@ class Sudoko(object):
                              f"found {len(lines)}, which are:\n"
                              f"{lines}")
 
-        log.critical(f"string_version:\n{string_version}")
-        log.critical(f"lines: {lines}")
+        # log.critical(f"string_version:\n{string_version}")
+        # log.critical(f"lines: {lines}")
 
         # Read user's input.
         for row_zb in range(N):

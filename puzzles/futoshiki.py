@@ -5,22 +5,20 @@ futoshiki.py
 
 ===============================================================================
 
-    Copyright (C) 2015-2019 Rudolf Cardinal (rudolf@pobox.com).
+    Copyright (C) 2019-2019 Rudolf Cardinal (rudolf@pobox.com).
 
-    This file is part of CRATE.
-
-    CRATE is free software: you can redistribute it and/or modify
+    This is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
     the Free Software Foundation, either version 3 of the License, or
     (at your option) any later version.
 
-    CRATE is distributed in the hope that it will be useful,
+    This software is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
     GNU General Public License for more details.
 
     You should have received a copy of the GNU General Public License
-    along with CRATE. If not, see <http://www.gnu.org/licenses/>.
+    along with this software. If not, see <http://www.gnu.org/licenses/>.
 
 ===============================================================================
 
@@ -39,11 +37,13 @@ from cardinal_pythonlib.logs import main_only_quicksetup_rootlogger
 # from cardinal_pythonlib.maths_py import sum_of_integers_in_inclusive_range
 from mip import BINARY, Model, xsum
 
+from common import debug_model_vars
+
 log = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Futoshiki
+# Constants
 # =============================================================================
 
 # String representations
@@ -56,9 +56,28 @@ UNKNOWN_STR = "."
 UNKNOWN_POSSIBLES = ".?"
 SPACE = " "
 NEWLINE = "\n"
+COMMENT = "#"
 
 ALMOST_ONE = 0.99
 
+DEMO_FUTOSHIKI_1 = """
+# Times, 2 Dec 2019, Futoshiki no. 3576
+
+.>.<. . .
+
+. . .>. .
+    ^
+. .>. .<.
+
+. . . . .
+^   ^
+.<. . . .
+"""
+
+
+# =============================================================================
+# Futoshiki
+# =============================================================================
 
 class Futoshiki(object):
     """
@@ -106,17 +125,24 @@ class Futoshiki(object):
             ] for _row_zb in range(n - 1)
         ]  # type: List[List[Optional[str]]]
         # ... index as self.inequality_down[row_zb][col_zb]
+        self.working = []  # type: List[str]
 
         # Check input is basically sound
         lines = string_version.splitlines()
         if not lines:
             raise ValueError("No data")
-        if not lines[0]:  # Blank first line
-            lines = lines[1:]
+
+        # Remove comments
+        lines = [line for line in lines if not line.startswith(COMMENT)]
+
+        # Remove early blank lines
+        first_real_line = next(i for i, line in enumerate(lines) if line)
+        lines = lines[first_real_line:]
+
         n_with_gaps = n + n - 1  # e.g. 5 for cells, 4 for inequalities
         lines = lines[:n_with_gaps]
-        if len(lines) != n_with_gaps:
-            raise ValueError(f"Must have {n_with_gaps} lines; "
+        if len(lines) < n_with_gaps:
+            raise ValueError(f"Must have at least {n_with_gaps} lines; "
                              f"found {len(lines)}, which are:\n"
                              f"{lines}")
 
@@ -163,6 +189,10 @@ class Futoshiki(object):
                                 else BOTTOM_LT_TOP
                             )
 
+    # -------------------------------------------------------------------------
+    # String representations
+    # -------------------------------------------------------------------------
+
     def __str__(self) -> str:
         return self.solution_str() if self.solved else self.problem_str()
 
@@ -186,7 +216,8 @@ class Futoshiki(object):
                 x += data[row_zb][col_zb]
                 if col_zb < self.n - 1:
                     x += self.inequality_right[row_zb][col_zb] or SPACE
-            x += NEWLINE
+            if row_zb < self.n - 1:
+                x += NEWLINE
             if row_zb < self.n - 1:
                 # Row-to-row inequalities
                 for col_zb in range(self.n):
@@ -196,15 +227,9 @@ class Futoshiki(object):
                 x += NEWLINE
         return x
 
-    @staticmethod
-    def _debug_model_vars(m: Model) -> None:
-        """
-        Show the names/values of model variables after fitting.
-        """
-        lines = [f"Variables in model {m.name!r}:"]
-        for v in m.vars:
-            lines.append(f"{v.name} == {v.x}")
-        log.debug("\n".join(lines))
+    # -------------------------------------------------------------------------
+    # Solve via integer programming
+    # -------------------------------------------------------------------------
 
     def solve(self) -> None:
         """
@@ -220,17 +245,21 @@ class Futoshiki(object):
 
         # BINARY or INTEGER?
         # - If BINARY, the tricky bit is specifying inequalities.
+        #
         #   - "Only one digit per row", "... per column", and "... per cell"
         #     are all easy.
-        # - If INTEGER, the tricky bit is specifying row/column constraints; we
-        #   can specify "==", ">=", and "<=", but not "!="
-        #   (:class:`mip.model.Var` does not provide :meth:`__ne__`).
+        #   - Achieved.
+        #
+        # - If INTEGER, the tricky bit is specifying row/column constraints
+        #   (e.g. "only one of each digit per row"). In mip, we can specify
+        #   "==", ">=", and "<=", but not "!=" (:class:`mip.model.Var` does not
+        #   provide :meth:`__ne__`).
+        #
+        #   - Not achieved. Abandoned.
 
-        # _BINARY_METHOD = '''
-
-        # ---------------------------------------------------------------------
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Variables
-        # ---------------------------------------------------------------------
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         x = [
             [
                 [
@@ -241,10 +270,9 @@ class Futoshiki(object):
             ] for r in range(n)
         ]  # index as: x[row_zb][col_zb][digit_zb]
 
-        # ---------------------------------------------------------------------
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Constraints
-        # ---------------------------------------------------------------------
-
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         def implement_less_than(r1: int, c1: int, r2: int, c2: int) -> None:
             """
             Implements the constraint value[r1, c1] < value[r2, c2].
@@ -289,105 +317,24 @@ class Futoshiki(object):
                     d_zb = int(self.problem_data[r][c]) - 1
                     m += x[r][c][d_zb] == 1
 
-        # ---------------------------------------------------------------------
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Solve
-        # ---------------------------------------------------------------------
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         m.optimize()
 
-        # ---------------------------------------------------------------------
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Read out answers
-        # ---------------------------------------------------------------------
-        self._debug_model_vars(m)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        debug_model_vars(m)
         if m.num_solutions:
             self.solved = True
+            self.working.append("Solved via integer programming method")
             for r in range(n):
                 for c in range(n):
                     for d_zb in range(n):
                         if x[r][c][d_zb].x > ALMOST_ONE:
                             self.solution_data[r][c] = str(d_zb + 1)
                             break
-
-        # '''
-
-        _INTEGER_METHOD = '''
-
-        # ---------------------------------------------------------------------
-        # Variables
-        # ---------------------------------------------------------------------
-        x = [
-            [
-                m.add_var(f"x(row_zb={r}, col={c}",
-                          var_type=INTEGER,
-                          lb=1,
-                          ub=n)
-                for c in range(n)
-            ] for r in range(n)
-        ]  # index as: x[row_zb][col_zb]
-
-        # ---------------------------------------------------------------------
-        # Constraints
-        # ---------------------------------------------------------------------
-        # We can use "<=" or ">=", but not "<" or ">".
-
-        n_sum = sum_of_integers_in_inclusive_range(1, n)
-        log.debug(f"Row/column sum: {n_sum}")
-
-        # One of each digit per row
-        for r in range(n):
-            m += xsum(x[r][c] for c in range(n)) == n_sum
-            # NOT ENOUGH, e.g. [4, 2, 4, 4, 1] sums to 15
-        # One of each digit per column
-        for c in range(n):
-            m += xsum(x[r][c] for r in range(n)) == n_sum
-            # NOT ENOUGH
-        # Horizontal inequalities
-        for r in range(n):
-            for c in range(n - 1):
-                ineq = self.inequality_right[r][c]
-                if ineq == LT:
-                    m += x[r][c] <= x[r][c + 1] - 1
-                elif ineq == GT:
-                    m += x[r][c + 1] <= x[r][c] - 1
-        # Vertical inequalities
-        for r in range(n - 1):
-            for c in range(n):
-                ineq = self.inequality_down[r][c]
-                if ineq == TOP_LT_BOTTOM:
-                    m += x[r][c] <= x[r + 1][c] - 1
-                elif ineq == BOTTOM_LT_TOP:
-                    m += x[r + 1][c] <= x[r][c] - 1
-        # Starting values
-        # NOT YET DONE
-
-        # ---------------------------------------------------------------------
-        # Solve
-        # ---------------------------------------------------------------------
-        m.optimize()
-
-        # ---------------------------------------------------------------------
-        # Read out answers
-        # ---------------------------------------------------------------------
-        self._debug_model_vars(m)
-        if m.num_solutions:
-            self.solved = True
-            for r in range(n):
-                for c in range(n):
-                    self.solution_data[r][c] = str(int(x[r][c].x))
-                    
-        '''
-
-
-DEMO_FUTOSHIKI_1 = Futoshiki("""
-.>.<. . .
-
-. . .>. .
-    ^
-. .>. .<.
-
-. . . . .
-^   ^
-.<. . . .
-""")  # Times, 2 Dec 2019, Futoshiki no. 3576
 
 
 # =============================================================================
@@ -398,8 +345,12 @@ def main() -> None:
     """
     Command-line entry point.
     """
-    cmd_solve = "solve"
     cmd_demo = "demo"
+    cmd_solve = "solve"
+    cmd_working = "working"
+
+    help_filename = (
+        "Puzzle filename to read. Must contain text in format as above.")
 
     parser = argparse.ArgumentParser(
         formatter_class=RawDescriptionArgumentDefaultsHelpFormatter,
@@ -409,20 +360,22 @@ def main() -> None:
         )
     )
     parser.add_argument(
-        "--verbose", action="store_true",
-        help="Be verbose"
-    )
+        "--verbose", action="store_true", help="Be verbose")
     subparsers = parser.add_subparsers(
         dest="command",
         # required=True,  # needs Python 3.7
-        help="Append --help for more help"
-    )
+        help="Append --help for more help")
 
-    parser_solve = subparsers.add_parser(cmd_solve, help="Solve from a file")
+    parser_solve = subparsers.add_parser(
+        cmd_solve, help="Solve from a file (via integer programming)")
     parser_solve.add_argument(
-        "filename", type=str, default="",
-        help=f"Puzzle filename to read. Must contain text in format as above."
-    )
+        "filename", type=str, default="", help=help_filename)
+
+    parser_working = subparsers.add_parser(
+        cmd_working,
+        help="Solve from a file, via puzzle logic, showing working")
+    parser_working.add_argument(
+        "filename", type=str, default="", help=help_filename)
 
     _parser_demo = subparsers.add_parser(cmd_demo, help="Run demo")
 
@@ -434,18 +387,26 @@ def main() -> None:
         print("Must specify command")
         sys.exit(1)
     if args.command == cmd_demo:
-        problem = DEMO_FUTOSHIKI_1
+        problem = Futoshiki(DEMO_FUTOSHIKI_1)
+        log.info(f"Solving:\n{problem}")
+        problem.solve()
     else:
         assert args.filename, "Must specify parameter: --filename"
         with open(args.filename, "rt") as f:
             string_version = f.read()
         problem = Futoshiki(string_version)
-
-    log.info(f"Solving:\n{problem}")
-    problem.solve()
+        log.info(f"Solving:\n{problem}")
+        if args.command == cmd_solve:
+            problem.solve()
+        else:
+            problem.solve_logic()
     log.info(f"Answer:\n{problem}")
     sys.exit(0)
 
+
+# =============================================================================
+# Command-line entry point
+# =============================================================================
 
 if __name__ == "__main__":
     try:

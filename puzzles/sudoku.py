@@ -28,13 +28,15 @@ sudoku.py
 
 
 import argparse
+from copy import deepcopy
+from itertools import combinations
 import logging
 import sys
-from typing import List, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from cardinal_pythonlib.argparse_func import RawDescriptionArgumentDefaultsHelpFormatter  # noqa
 from cardinal_pythonlib.logs import main_only_quicksetup_rootlogger
-from mip import BINARY, Constr, Model, Var, xsum
+from mip import BINARY, Model, xsum
 
 from common import debug_model_constraints, debug_model_vars
 
@@ -49,7 +51,10 @@ UNKNOWN = "."
 NEWLINE = "\n"
 SPACE = " "
 COMMENT = "#"
-INTERPUNCT = "·"
+HASH = "#"
+DISPLAY_INITIAL = "■"
+DISPLAY_UNKNOWN = "·"
+DISPLAY_SOLVED = "♦"
 ALMOST_ONE = 0.99
 N = 9
 T = 3
@@ -69,6 +74,695 @@ DEMO_SUDOKU_1 = """
 .91 4.5 6..
 ... ..9 ...
 """
+
+
+# =============================================================================
+# Exceptions
+# =============================================================================
+
+class SolutionFailure(Exception):
+    pass
+
+
+# =============================================================================
+# SudokuPossibilities
+# =============================================================================
+
+class SudokuPossibilities(object):
+    """
+    Represents Sudoku possibilities, for a logic-based eliminator.
+
+    Based on SuDokuSolver (C++, 2005) by me, at
+    http://egret.psychol.cam.ac.uk/code/index.html.
+
+    Strategy:
+
+    1.  Attempt to solve current state of puzzle analytically.
+
+    2.  If unsolved, guess one value and attempt to solve that, recursively,
+        until all possible uncertain values have been guessed or a solution has
+        been found.
+
+    Tactics:
+
+    1.  Analyse using a three-dimensional matrix (x, y, digit) of boolean
+        variables indicating the possibility of a digit being in a particular
+        location or cell.
+
+    2.  Where a digit is known, eliminate it as a possibility from other cells
+        in the same row/column/3x3 square.
+
+    3.  Where there is only one possible cell for a digit in a
+        row/column/square, confirm that digit by eliminating other possible
+        digits from that cell.
+
+    4.  Where there are n identical sets of n possible locations for n digits
+        (e.g. for n=2: digit 4 can only be in locations A or B, and digit 8 can
+        only be in locations A or B), eliminate all other possible digits from
+        those locations. This is an extension of the previous tactic (for which
+        n=1).
+
+    5.  Repeat these tactics until the puzzle is solved or there is no
+        improvement in knowledge.
+
+    """
+    def __init__(self, other: "SudokuPossibilities" = None) -> None:
+        """
+        Initialize with "everything is possible", or copy from another.
+        """
+        self.guess_level = 0
+        if other:
+            self.initial_values_zb = deepcopy(other.initial_values_zb)
+            self.possible = deepcopy(other.possible)
+            self.working = deepcopy(other.working)
+        else:
+            self.initial_values_zb = [
+                [
+                    None for _c in range(N)
+                ] for _r in range(N)
+            ]  # type: List[List[Optional[int]]]
+            # ... index as: self.initial[row_zb][col_zb]
+            self.possible = [
+                [
+                    [
+                        True for _d in range(N)
+                    ] for _c in range(N)
+                ] for _r in range(N)
+            ]  # type: List[List[List[bool]]]
+            # ... index as: self.possible[row_zb][col_zb][digit_zb]
+            self.working = []  # type: List[str]
+
+    # -------------------------------------------------------------------------
+    # Setup
+    # -------------------------------------------------------------------------
+
+    def set_initial_values(self,
+                           initial_values: List[List[Optional[int]]]) -> None:
+        """
+        Set up the initial values. The incoming digits are genuine (one-based),
+        not zero-based.
+        """
+        assert len(initial_values) == N
+        for r in range(N):
+            row = initial_values[r]
+            assert len(row) == N
+            for c in range(N):
+                value = row[c]
+                if value is not None:
+                    d_zb = value - 1
+                    self.initial_values_zb[r][c] = d_zb
+                    self.assign_digit(r, c, d_zb, source="Starting value")
+                else:
+                    self.initial_values_zb[r][c] = None
+
+    # -------------------------------------------------------------------------
+    # Visuals
+    # -------------------------------------------------------------------------
+
+    def note(self, msg: str) -> None:
+        """
+        Save some working.
+        """
+        self.working.append(msg)
+        log.info(msg)
+
+    @staticmethod
+    def _pstr_row_col(row_zb: int, col_zb: int, digit_zb: int) \
+            -> Tuple[int, int]:
+        """
+        For __str__(): ``row, col`` (``y, x``) coordinates.
+        """
+        x_base = col_zb * (T + 1)
+        y_base = row_zb * (T + 1)
+        x_offset = digit_zb % T
+        y_offset = digit_zb // T
+        return (y_base + y_offset), (x_base + x_offset)
+
+    def __str__(self) -> str:
+        """
+        Returns a visual representation of possibilities.
+        """
+        pn = N * 4 - 1
+
+        # Create grid of characters
+        # BEWARE: DO NOT DO THIS: strings = [[" "] * pn] * pn
+        # ... it creates copies of identical strings/lists, so when you
+        # modify one, it modifies them all.
+        strings = []  # type: List[List[str]]
+        for _ in range(pn):
+            line = []  # type: List[str]
+            for _ in range(pn):
+                line.append(" ")
+            strings.append(line)
+
+        # Prettify
+        cell_boundaries = ((T + 1) * T - 1, (T + 1) * (T * 2) - 1)
+        for r in cell_boundaries:
+            for i in range(pn):
+                strings[r][i] = "-"
+        for c in cell_boundaries:
+            for i in range(pn):
+                strings[i][c] = "|"
+        for r in cell_boundaries:
+            for c in cell_boundaries:
+                strings[r][c] = "+"
+
+        # Data
+        for r in range(N):
+            for c in range(N):
+                initial_value = self.initial_values_zb[r][c] is not None
+                cell_solved = self.n_possibilities(r, c) == 1
+                for d_zb in range(N):
+                    y, x = self._pstr_row_col(r, c, d_zb)
+                    if self.possible[r][c][d_zb]:
+                        txt = str(d_zb + 1)
+                    elif initial_value:
+                        txt = DISPLAY_INITIAL
+                    elif cell_solved:
+                        txt = DISPLAY_SOLVED
+                    else:
+                        txt = DISPLAY_UNKNOWN
+                    strings[y][x] = txt
+        return "\n".join("".join(x for x in line) for line in strings)
+
+    # -------------------------------------------------------------------------
+    # Calculation helpers
+    # -------------------------------------------------------------------------
+
+    def n_unknown_cells(self) -> int:
+        """
+        Number of unsolved cells. Maximum is 81.
+        """
+        return sum(
+            1 if self.n_possibilities(r, c) != 1 else 0
+            for r in range(N)
+            for c in range(N)
+        )
+
+    def n_possibilities_overall(self) -> int:
+        """
+        Number of row/cell/digit possibilities overall.
+        Minimum is 81 (solved). Maximum is 729.
+        """
+        return sum(
+            self.n_possibilities(r, c)
+            for r in range(N)
+            for c in range(N)
+        )
+
+    def n_possibilities(self, row_zb: int, col_zb: int) -> int:
+        """
+        Number of possible digits for a cell.
+        """
+        return sum(self.possible[row_zb][col_zb])
+
+    def possible_digits(self, row_zb: int, col_zb: int) -> List[int]:
+        """
+        Returns possible digits, in ZERO-BASED format, for a given cell.
+        They are always returned in ascending order.
+        """
+        return list(
+            d for d, v in enumerate(self.possible[row_zb][col_zb]) if v
+        )
+
+    def solved(self) -> bool:
+        """
+        Are we there yet?
+        """
+        for r in range(N):
+            for c in range(N):
+                if self.n_possibilities(r, c) != 1:
+                    return False
+        return True
+
+    @staticmethod
+    def square_extremes_for_cell(row_zb: int, col_zb: int) \
+            -> Tuple[int, int, int, int]:
+        """
+        Defines the boundaries of the 3x3 square containing a particular cell.
+
+        Returns ``row_min, row_max, col_min, col_max``.
+        """
+        row_min = (row_zb // T) * T
+        row_max = row_min + T - 1
+        col_min = (col_zb // T) * T
+        col_max = col_min + T - 1
+        return row_min, row_max, col_min, col_max
+
+    @staticmethod
+    def top_left_cell_for_square(square_zb: int) -> Tuple[int, int]:
+        """
+        Returns ``row_zb, col_zb`` for the top-left cell in a 3x3 square
+        (numbered from 0 to N - 1).
+        """
+        row = (square_zb // T) * T
+        col = (square_zb % T) * T
+        return row, col
+
+    @classmethod
+    def square_extremes_for_square(cls, square_zb: int) \
+            -> Tuple[int, int, int, int]:
+        """
+        Defines the boundaries of the 3x3 square, numbered from 0 to (N - 1).
+
+        Returns ``row_min, row_max, col_min, col_max``.
+        """
+        row, col = cls.top_left_cell_for_square(square_zb)
+        return cls.square_extremes_for_cell(row, col)
+
+    # -------------------------------------------------------------------------
+    # Computations
+    # -------------------------------------------------------------------------
+
+    def assign_digit(self, row_zb: int, col_zb: int, digit_zb: int,
+                     source: str = "?") -> bool:
+        """
+        Assign a digit to a cell.
+
+        Returns: improved?
+        """
+        improved = False
+        for d in range(N):
+            if d == digit_zb:
+                assert self.possible[row_zb][col_zb][d], (
+                    f"{source}: Assigning digit {digit_zb + 1} to "
+                    f"row={row_zb + 1}, col={col_zb + 1} "
+                    f"where that is known to be impossible"
+                )
+            else:
+                improved = improved or self.possible[row_zb][col_zb][d]
+                self.possible[row_zb][col_zb][d] = False
+        if improved:
+            self.note(f"{source}: Assigning digit {digit_zb + 1} to "
+                      f"row={row_zb + 1}, col={col_zb + 1}")
+        return improved
+
+    def _restrict_cells(self, cells: Sequence[Tuple[int, int]],
+                        digits_zb_to_keep: Sequence[int],
+                        source: str = "?") -> bool:
+        """
+        Restricts a cell or cells to a specific set of digits.
+        Cells are specified as ``row_zb, col_zb`` tuples.
+        Digits are also zero-based.
+        """
+        improved = False
+        for row, col in cells:
+            initial_n = self.n_possibilities(row, col)
+            for d in range(N):
+                if d in digits_zb_to_keep:
+                    continue
+            final_n = self.n_possibilities(row, col)
+            if final_n == 0:
+                raise SolutionFailure()
+            this_cell_improved = final_n < initial_n
+            if this_cell_improved and final_n == 1:  # unlikely!
+                self.note(f"{source}: "
+                          f"row={row + 1}, col={col + 1} must be "
+                          f"{self.possible_digits(row, col)[0] + 1}")
+            improved = improved or this_cell_improved
+        return improved
+
+    def _eliminate_from_cell(self, row_zb: int, col_zb: int,
+                             digit_zb: int, source: str = "?") -> bool:
+        """
+        Eliminates a digit as a possibility from a cell.
+        Returns: improved?
+        """
+        if not self.possible[row_zb][col_zb][digit_zb]:
+            return False
+        self.possible[row_zb][col_zb][digit_zb] = False
+        n = self.n_possibilities(row_zb, col_zb)
+        if n == 0:
+            raise SolutionFailure()
+        if n == 1:  # improved down to 1
+            self.note(f"{source}: "
+                      f"row={row_zb + 1}, col={col_zb + 1} must be "
+                      f"{self.possible_digits(row_zb, col_zb)[0] + 1}")
+        return True
+
+    def _eliminate_from_row(self, row_zb: int, except_cols_zb: List[int],
+                            digits_zb_to_eliminate: Iterable[int],
+                            source: str = "?") -> bool:
+        """
+        Eliminates a digit or digits from all cells in a row except the one(s)
+        specified.
+
+        Returns: Improved?
+        """
+        improved = False
+        for c in range(N):
+            if c in except_cols_zb:
+                continue
+            for d in digits_zb_to_eliminate:
+                zsource = f"{source}: eliminate_from_row, eliminating {d + 1}"
+                improved = self._eliminate_from_cell(
+                    row_zb, c, d, source=zsource) or improved
+        return improved
+
+    def _eliminate_from_col(self, except_rows_zb: List[int], col_zb: int,
+                            digits_zb_to_eliminate: Iterable[int],
+                            source: str = "?") -> bool:
+        """
+        Eliminates a digit or digits from all cells in a column except the
+        one(s) specified.
+
+        Returns: Improved?
+        """
+        improved = False
+        for r in range(N):
+            if r in except_rows_zb:
+                continue
+            for d in digits_zb_to_eliminate:
+                zsource = f"{source}: eliminate_from_col, eliminating {d + 1}"
+                improved = self._eliminate_from_cell(
+                    r, col_zb, d, source=zsource) or improved
+        return improved
+
+    def _eliminate_from_square(self, except_cells_zb: List[Tuple[int, int]],
+                               digits_zb_to_eliminate: Iterable[int],
+                               source: str = "?") -> bool:
+        """
+        Eliminates a digit or digits from all cells in a 3x3 "square" except
+        the cell(s) specified.
+
+        Returns: Improved?
+        """
+        row_min, row_max, col_min, col_max = self.square_extremes_for_cell(
+            row_zb=min(t[0] for t in except_cells_zb),
+            col_zb=min(t[1] for t in except_cells_zb)
+        )
+        assert (row_min, row_max, col_min, col_max) == (
+            self.square_extremes_for_cell(
+                row_zb=max(t[0] for t in except_cells_zb),
+                col_zb=max(t[1] for t in except_cells_zb)
+            )
+        ), "except_cells_zb spans more than one 3x3 square!"
+        improved = False
+        for r in range(row_min, row_max + 1):
+            for c in range(col_min, col_max + 1):
+                if (r, c) in except_cells_zb:
+                    continue
+                for d in digits_zb_to_eliminate:
+                    zsource = (
+                        f"{source}: eliminate_from_square, eliminating {d + 1}"
+                    )
+                    improved = self._eliminate_from_cell(
+                        r, c, d, source=zsource) or improved
+        return improved
+
+    def _eliminate_simple(self) -> bool:
+        """
+        Where a cell is known, eliminate other possibilities in its row, cell,
+        and 3x3 square.
+
+        Returns: improved?
+        """
+        log.debug("Eliminating, simple...")
+        source = "eliminate_simple"
+        improved = False
+        for row in range(N):
+            for col in range(N):
+                d_possible = self.possible_digits(row, col)
+                if len(d_possible) == 1:
+                    d = d_possible[0]
+                    imp_row = self._eliminate_from_row(row, [col], [d],
+                                                       source=source)
+                    imp_col = self._eliminate_from_col([row], col, [d],
+                                                       source=source)
+                    imp_square = self._eliminate_from_square([(row, col)], [d],
+                                                             source=source)
+                    improved = improved or imp_row or imp_col or imp_square
+        return improved
+
+    def _find_only_possibilities(self) -> bool:
+        """
+        Where there is only one location for a digit in a row, cell, or square,
+        assign it.
+        """
+        improved = False
+        for d in range(N):
+            source = f"find_only_possibilities, digit={d + 1}"
+            # Rows
+            for r in range(N):
+                possible_cols = [c for c in range(N) if self.possible[r][c][d]]
+                if len(possible_cols) == 1:
+                    improved = self.assign_digit(
+                        r, possible_cols[0], d, source=source) or improved
+            # Columns
+            for c in range(N):
+                possible_rows = [r for r in range(N) if self.possible[r][c][d]]
+                if len(possible_rows) == 1:
+                    improved = self.assign_digit(
+                        possible_rows[0], c, d, source=source) or improved
+            # Squares
+            for s in range(N):
+                row_min, row_max, col_min, col_max = \
+                    self.square_extremes_for_square(s)
+                possible_cells = [
+                    (r, c)
+                    for r in range(row_min, row_max + 1)
+                    for c in range(col_min, col_max + 1)
+                    if self.possible[r][c][d]
+                ]
+                if len(possible_cells) == 1:
+                    improved = self.assign_digit(
+                        possible_cells[0][0],
+                        possible_cells[0][1], d, source=source) or improved
+        return improved
+
+    def _eliminate_constraintwise(self) -> bool:
+        """
+        Example: if we don't know where the 5 is in a particular 3x3 square,
+        but we know that it's in the first row, then we can eliminate "5" from
+        that row in all other cells.
+
+        Returns: improved?
+        """
+        log.debug(f"Eliminating, constraint-wise...")
+        improved = False
+        for s in range(N):
+            row_min, row_max, col_min, col_max = \
+                self.square_extremes_for_square(s)
+            rownums = list(range(row_min, row_max + 1))
+            colnums = list(range(col_min, col_max + 1))
+            for d in range(N):
+                source = (
+                    f"eliminate_constraintwise from square {s + 1}, "
+                    f"eliminating {d + 1}"
+                )
+                possible_cells_for_digit = [
+                    (r, c)
+                    for r in rownums
+                    for c in colnums
+                    if d in self.possible_digits(r, c)
+                ]
+                possible_rows = list(set(
+                    rc[0] for rc in possible_cells_for_digit))
+                possible_cols = list(set(
+                    rc[1] for rc in possible_cells_for_digit))
+                if len(possible_rows) == 1:
+                    improved = self._eliminate_from_row(
+                        row_zb=possible_rows[0],
+                        except_cols_zb=colnums,
+                        digits_zb_to_eliminate=[d],
+                        source=source
+                    ) or improved
+                if len(possible_cols) == 1:
+                    improved = self._eliminate_from_col(
+                        col_zb=possible_cols[0],
+                        except_rows_zb=rownums,
+                        digits_zb_to_eliminate=[d],
+                        source=source
+                    ) or improved
+        return improved
+
+    def _eliminate_groupwise(self, groupsize: int) -> bool:
+        """
+        Scan through all numbers in groups of n. If there are exactly n
+        possible cells for each of those n numbers in a row/column/square, and
+        those possibilities are all the same, eliminate other possible digits
+        for those cells.
+
+        Example: in row 1, if digit 4 could be in columns 5/7 only, and digit 8
+        could be in columns 5/7 only, then either '4' goes in column 5 and '8'
+        goes in column 7, or vice versa - but these cells can't possibly
+        contain anything other than '4' or '8'.
+
+        We've done n=1 above, so our caller will begin with n=2. No point going
+        to n=9 (that means we have no information!) or n=8 (if 8 wholly
+        uncertain digits, then 1 completely certain digit, and that situation
+        was dealt with above, in :meth:`_eliminate_simple`).
+
+        Returns: improved?
+        """
+        log.debug(f"Eliminating, groupwise, group size {groupsize}...")
+        improved = False
+        for digit_combo in combinations(range(N), r=groupsize):
+            pretty_digits = [d + 1 for d in digit_combo]
+            source = f"eliminate_groupwise, digits={pretty_digits}"
+            # Rows
+            combo_set = set(digit_combo)
+            for row in range(N):
+                columns_with_only_these_digits = [
+                    col for col in range(N)
+                    if combo_set.issubset(self.possible_digits(row, col))
+                ]
+                columns_with_any_of_these_digits = [
+                    col for col in range(N)
+                    if combo_set.intersection(self.possible_digits(row, col))
+                ]
+                if (len(columns_with_only_these_digits) == groupsize and
+                        len(columns_with_any_of_these_digits) == groupsize):
+                    prettycol = [c + 1 for c in columns_with_only_these_digits]
+                    log.debug(
+                        f"In row {row + 1}, only columns {prettycol} "
+                        f"could contain digits {pretty_digits}")
+                    improved = self._eliminate_from_row(
+                        row_zb=row,
+                        except_cols_zb=columns_with_only_these_digits,
+                        digits_zb_to_eliminate=digit_combo,
+                        source=source
+                    ) or improved
+                    improved = self._restrict_cells(
+                        cells=[(row, c)
+                               for c in columns_with_only_these_digits],
+                        digits_zb_to_keep=digit_combo,
+                        source=source
+                    ) or improved
+            # Columns
+            for col in range(N):
+                rows_with_only_these_digits = [
+                    row for row in range(N)
+                    if combo_set.issubset(self.possible_digits(row, col))
+                ]
+                rows_with_any_of_these_digits = [
+                    row for row in range(N)
+                    if combo_set.intersection(self.possible_digits(row, col))
+                ]
+                if (len(rows_with_only_these_digits) == groupsize and
+                        len(rows_with_any_of_these_digits) == groupsize):
+                    prettyrow = [r + 1 for r in rows_with_only_these_digits]
+                    log.debug(
+                        f"In column {col + 1}, only rows {prettyrow} "
+                        f"could contain digits {pretty_digits}")
+                    improved = self._eliminate_from_col(
+                        col_zb=col,
+                        except_rows_zb=rows_with_only_these_digits,
+                        digits_zb_to_eliminate=digit_combo,
+                        source=source
+                    ) or improved
+                    improved = self._restrict_cells(
+                        cells=[(r, col)
+                               for r in rows_with_only_these_digits],
+                        digits_zb_to_keep=digit_combo,
+                        source=source
+                    ) or improved
+            # Squares
+            for square in range(N):
+                row_min, row_max, col_min, col_max = \
+                    self.square_extremes_for_square(square)
+                cells_with_only_these_digits = [
+                    (row, col)
+                    for row in range(row_min, row_max + 1)
+                    for col in range(col_min, col_max + 1)
+                    if combo_set.issubset(self.possible_digits(row, col))
+                ]
+                cells_with_any_of_these_digits = [
+                    (row, col)
+                    for row in range(row_min, row_max + 1)
+                    for col in range(col_min, col_max + 1)
+                    if combo_set.intersection(self.possible_digits(row, col))
+                ]
+                if (len(cells_with_only_these_digits) == groupsize and
+                        len(cells_with_any_of_these_digits) == groupsize):
+                    prettycell = [(r + 1, c+1)
+                                  for r, c in cells_with_only_these_digits]
+                    log.debug(
+                        f"In 3x3 square #{square + 1}, "
+                        f"only cells {prettycell} "
+                        f"could contain digits {pretty_digits}")
+                    improved = self._eliminate_from_square(
+                        except_cells_zb=cells_with_only_these_digits,
+                        digits_zb_to_eliminate=digit_combo,
+                        source=source
+                    ) or improved
+                    improved = self._restrict_cells(
+                        cells=cells_with_only_these_digits,
+                        digits_zb_to_keep=digit_combo,
+                        source=source
+                    ) or improved
+        return improved
+
+    def eliminate(self) -> bool:
+        """
+        Eliminates the impossible.
+
+        Returns: improved?
+        """
+        improved = self._eliminate_simple()
+        improved = self._find_only_possibilities() or improved
+        if improved:
+            return improved  # Keep it simple...
+
+        improved = self._eliminate_constraintwise()
+        if improved:
+            return improved  # Keep it simple...
+
+        for groupsize in range(2, N):  # from 2 to 8
+            improved = self._eliminate_groupwise(groupsize) or improved
+            if improved:
+                return improved
+
+        return improved
+
+    def solve(self) -> None:
+        """
+        Solves by elimination.
+        """
+        iteration = 0
+        while not self.solved():
+            log.debug(
+                f"Iteration {iteration}. "
+                f"Unsolved cells: {self.n_unknown_cells()}. "
+                f"Possible digit assignments: "
+                f"{self.n_possibilities_overall()} (target {N * N}). "
+                f"Possibilities:\n{self}")
+            improved = self.eliminate()
+            if not improved:
+                self.note("No improvement; guessing")
+                log.debug(f"Possibilities:\n{self}")
+                self.guess()
+            iteration += 1
+
+    def guess(self) -> None:
+        """
+        Implements the "guess" method!
+
+        Using this means that the algorithm has deficiencies (or the puzzle
+        does).
+        """
+        for r in range(N):
+            for c in range(N):
+                digits = self.possible_digits(r, c)
+                if len(digits) == 1:
+                    continue
+                for d in digits:
+                    p = SudokuPossibilities(self)
+                    p.guess_level = self.guess_level + 1
+                    log.warning("Guessing")
+                    p.assign_digit(r, c, d,
+                                   source=f"guess level {p.guess_level}")
+                    try:
+                        p.solve()
+                        assert p.solved()
+                        log.info(f"Guess level {p.guess_level} was good")
+                        # no need to copy initial_values_zb
+                        self.possible = p.possible
+                        self.working = p.working
+                        return
+                    except SolutionFailure:
+                        log.info(
+                            f"Bad guess at level {p.guess_level}; moving on")
 
 
 # =============================================================================
@@ -111,7 +805,7 @@ class Sudoku(object):
             raise ValueError("No data")
 
         # Remove comments
-        lines = [line for line in lines if not line.startswith(COMMENT)]
+        lines = [line for line in lines if not line.startswith(HASH)]
 
         lines = ["".join(line.split())
                  for line in lines if line]  # remove blank lines/columns
@@ -206,12 +900,12 @@ class Sudoku(object):
             # One of each digit per column
             for c in range(N):
                 m += xsum(x[r][c][d] for r in range(N)) == 1
-        # One of each digit in each 3x3 box:
+        # One of each digit in each 3x3 square:
         for d in range(N):
-            for box_row in range(T):
-                for box_col in range(T):
-                    row_base = box_row * T
-                    col_base = box_col * T
+            for square_row in range(T):
+                for square_col in range(T):
+                    row_base = square_row * T
+                    col_base = square_col * T
                     m += xsum(
                         x[row_base + row_offset][col_base + col_offset][d]
                         for row_offset in range(T)
@@ -258,208 +952,29 @@ class Sudoku(object):
             log.info("Already solved")
             return
 
-        possible = [
-            [
-                [
-                    True for _d in range(N)
-                ] for _c in range(N)
-            ] for _r in range(N)
-        ]  # ... index as: possible[row_zb][col_zb][digit_zb]
-
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Visuals
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-        def note(msg: str) -> None:
-            """
-            Save some working.
-            """
-            self.working.append(msg)
-            log.info(msg)
-
-        def pstr_row_col(row_zb: int, col_zb: int, digit_zb: int) \
-                -> Tuple[int, int]:
-            """
-            For possible_str(): ``row, col`` (``y, x``) coordinates.
-            """
-            x_base = col_zb * (T + 1)
-            y_base = row_zb * (T + 1)
-            x_offset = digit_zb % T
-            y_offset = digit_zb // T
-            return (y_base + y_offset), (x_base + x_offset)
-
-        def possible_str() -> str:
-            """
-            Returns a visual representation of possibilities.
-            """
-            pn = N * 4 - 1
-
-            # Create grid of characters
-            # BEWARE: DO NOT DO THIS: strings = [[" "] * pn] * pn
-            # ... it creates copies of identical strings/lists, so when you
-            # modify one, it modifies them all.
-            strings = []  # type: List[List[str]]
-            for _ in range(pn):
-                line = []  # type: List[str]
-                for _ in range(pn):
-                    line.append(" ")
-                strings.append(line)
-
-            # Prettify
-            cell_boundaries = ((T + 1) * T - 1, (T + 1) * (T * 2) - 1)
-            for r in cell_boundaries:
-                for i in range(pn):
-                    strings[r][i] = "-"
-            for c in cell_boundaries:
-                for i in range(pn):
-                    strings[i][c] = "|"
-            for r in cell_boundaries:
-                for c in cell_boundaries:
-                    strings[r][c] = "+"
-
-            # Data
-            for r in range(N):
-                for c in range(N):
-                    for d_zb in range(N):
-                        y, x = pstr_row_col(r, c, d_zb)
-                        txt = str(d_zb + 1) if possible[r][c][d_zb] else INTERPUNCT  # noqa
-                        strings[y][x] = txt
-            return "\n".join("".join(x for x in line) for line in strings)
-
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Calculation helpers
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-        def n_possibilities(row_zb: int, col_zb: int) -> None:
-            """
-            Number of possible digits for a cell.
-            """
-            return sum(possible[row_zb][col_zb])
-
-        def possible_digits(row_zb: int, col_zb: int) -> List[int]:
-            """
-            Returns possible digits, in ZERO-BASED format, for a given cell.
-            """
-            return list(d for d, v in enumerate(possible[row_zb][col_zb]) if v)
-
-        def solved() -> bool:
-            """
-            Are we there yet?
-            """
-            for r in range(N):
-                for c in range(N):
-                    if n_possibilities(r, c) != 1:
-                        return False
-            return True
-
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Computations
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-        def assign_digit(row_zb: int, col_zb: int, digit_zb: int,
-                         start: bool = False) -> None:
-            """
-            Assign a digit to a cell.
-            """
-            nonlocal possible
-            text = "Starting value:" if start else "Calculated:"
-            note(f"{text} Assigning digit {digit_zb + 1} to "
-                 f"row={row_zb + 1}, col={col_zb + 1}")
-            for d in range(N):
-                if d == digit_zb:
-                    assert possible[row_zb][col_zb][d], (
-                        f"{text} Assigning digit {digit_zb + 1} to "
-                        f"row={row_zb + 1}, col={col_zb + 1} "
-                        f"where that is known to be impossible"
-                    )
-                else:
-                    possible[row_zb][col_zb][d] = False
-
-        def eliminate_from_row(row_zb: int, except_cols_zb: List[int],
-                               digits_zb_to_eliminate: List[int]) -> None:
-            nonlocal possible
-            for c in range(N):
-                if c in except_cols_zb:
-                    continue
-                for d in digits_zb_to_eliminate:
-                    possible[row_zb][c][d] = False
-
-        def eliminate_from_col(except_rows_zb: List[int], col_zb: int,
-                               digits_zb_to_eliminate: List[int]) -> None:
-            nonlocal possible
-            for r in range(N):
-                if r in except_rows_zb:
-                    continue
-                for d in digits_zb_to_eliminate:
-                    possible[r][col_zb][d] = False
-
-        def eliminate_from_box(except_cells_zb: List[Tuple[int, int]],
-                               digits_zb_to_eliminate: List[int]) -> None:
-            nonlocal possible
-            except_row_min = min(t[0] for t in except_cells_zb)
-            except_row_max = max(t[0] for t in except_cells_zb)
-            except_col_min = min(t[1] for t in except_cells_zb)
-            except_col_max = max(t[1] for t in except_cells_zb)
-            startrow = (except_row_min // T) * T
-            endrow = startrow + T
-            assert endrow > except_row_max
-            startcol = (except_col_min // T) * T
-            endcol = startcol + T
-            assert endcol > except_col_max
-            # log.critical(
-            #     f"except_cells_zb={except_cells_zb}, "
-            #     f"digits_zb_to_eliminate={digits_zb_to_eliminate}, "
-            #     f"startrow={startrow}, endrow={endrow}, "
-            #     f"startcol={startcol}, endcol={endcol}"
-            # )
-            for r in range(startrow, endrow):
-                for c in range(startcol, endcol):
-                    if (r, c) in except_cells_zb:
-                        continue
-                    for d in digits_zb_to_eliminate:
-                        possible[r][c][d] = False
-
-        def eliminate() -> None:
-            """
-            Eliminates the impossible.
-            """
-            for row in range(N):
-                for col in range(N):
-                    d_possible = possible_digits(row, col)
-                    if len(d_possible) == 1:
-                        d = d_possible[0]
-                        eliminate_from_row(row, [col], [d])
-                        eliminate_from_col([row], col, [d])
-                        eliminate_from_box([(row, col)], [d])
-
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Main process
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        p = SudokuPossibilities()  # start from scratch
 
         # Set starting values.
+        initial_values = [
+            [
+                None for _c in range(N)
+            ] for _r in range(N)
+        ]  # type: List[List[Optional[int]]]
         for r in range(N):
             for c in range(N):
                 known_digit_str = self.problem_data[r][c]
                 if known_digit_str != UNKNOWN:
-                    d_zb = int(known_digit_str) - 1
-                    assign_digit(r, c, d_zb, start=True)
+                    initial_values[r][c] = int(known_digit_str)
+        p.set_initial_values(initial_values)
 
         # Eliminate and iterate
-        iteration = 0
-        while not solved():
-            log.debug(f"Iteration {iteration}. Possibilities:\n{possible_str()}")  # noqa
-            if iteration >= 1:
-                crash
-            eliminate()
-            iteration += 1
-            # *** do more
+        p.solve()
 
         # Read out answers
         self.solved = True
         for r in range(N):
             for c in range(N):
-                d_zb = next(
-                    i for i, v in enumerate(self.possibilities[r, c]) if v)
+                d_zb = next(i for i, v in enumerate(p.possible[r][c]) if v)
                 self.solution_data[r][c] = str(d_zb + 1)
 
 

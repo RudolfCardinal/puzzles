@@ -37,7 +37,7 @@ from cardinal_pythonlib.logs import main_only_quicksetup_rootlogger
 # from cardinal_pythonlib.maths_py import sum_of_integers_in_inclusive_range
 from mip import BINARY, Model, xsum
 
-from common import debug_model_vars
+from puzzles.common import debug_model_vars
 
 log = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ UNKNOWN_STR = "."
 UNKNOWN_POSSIBLES = ".?"
 SPACE = " "
 NEWLINE = "\n"
-COMMENT = "#"
+HASH = "#"
 
 ALMOST_ONE = 0.99
 
@@ -133,7 +133,7 @@ class Futoshiki(object):
             raise ValueError("No data")
 
         # Remove comments
-        lines = [line for line in lines if not line.startswith(COMMENT)]
+        lines = [line for line in lines if not line.startswith(HASH)]
 
         # Remove early blank lines
         first_real_line = next(i for i, line in enumerate(lines) if line)

@@ -24,20 +24,36 @@ futoshiki.py
 
 **Solves Futoshiki puzzles.**
 
+Like the Sudoku solver, it uses integer programming ("give me the answer") and
+an attempt at a logic-based approach ("show me how").
+
 """
 
 
 import argparse
+from copy import deepcopy
 import logging
+import math
 import sys
-from typing import List, Optional
+from typing import Generator, List, Optional, Tuple
 
 from cardinal_pythonlib.argparse_func import RawDescriptionArgumentDefaultsHelpFormatter  # noqa
 from cardinal_pythonlib.logs import main_only_quicksetup_rootlogger
 # from cardinal_pythonlib.maths_py import sum_of_integers_in_inclusive_range
 from mip import BINARY, Model, xsum
 
-from puzzles.common import debug_model_vars
+from common import (
+    ALMOST_ONE,
+    CommonPossibilities,
+    debug_model_vars,
+    DISPLAY_INITIAL,
+    DISPLAY_SOLVED,
+    DISPLAY_UNKNOWN,
+    HASH,
+    NEWLINE,
+    SPACE,
+    UNKNOWN,
+)
 
 log = logging.getLogger(__name__)
 
@@ -47,18 +63,11 @@ log = logging.getLogger(__name__)
 # =============================================================================
 
 # String representations
-LT = "<"
-GT = ">"
+LEFT_LT_RIGHT = "<"
+LEFT_GT_RIGHT = ">"
 TOP_LT_BOTTOM = "^"
 BOTTOM_LT_TOP = "v"
 BOTTOM_LT_TOP_POSSIBLES = "vV"
-UNKNOWN_STR = "."
-UNKNOWN_POSSIBLES = ".?"
-SPACE = " "
-NEWLINE = "\n"
-HASH = "#"
-
-ALMOST_ONE = 0.99
 
 DEMO_FUTOSHIKI_1 = """
 # Times, 2 Dec 2019, Futoshiki no. 3576
@@ -73,6 +82,416 @@ DEMO_FUTOSHIKI_1 = """
 ^   ^
 .<. . . .
 """
+
+
+# =============================================================================
+# FutoshikiPossibilities
+# =============================================================================
+
+class FutoshikiPossibilities(CommonPossibilities):
+    """
+    Represents Futoshiki possibilities, for a logic-based solver.
+    """
+    VISUAL_INEQ_GAP = 3
+
+    def __init__(self, other: "FutoshikiPossibilities" = None,
+                 n: int = 5) -> None:
+        """
+        Initialize with "everything is possible", or copy from another.
+        """
+        super().__init__(other=other, n=n)
+        if other:
+            self.inequalities_right = deepcopy(other.inequalities_right)
+            self.inequalities_down = deepcopy(other.inequalities_down)
+        else:
+            self.inequalities_right = [
+                [SPACE for _c in range(n - 1)]
+                for _r in range(n)
+            ]
+            # ... index as: self.inequalities_right[row_zb][col_zb]
+            self.inequalities_down = [
+                [SPACE for _c in range(n)]
+                for _r in range(n - 1)
+            ]
+            # ... index as: self.inequalities_right[row_zb][col_zb]
+
+    # -------------------------------------------------------------------------
+    # Setup
+    # -------------------------------------------------------------------------
+
+    def set_initial_values(self,
+                           initial_values: List[List[Optional[int]]],
+                           inequalities_right: List[List[str]],
+                           inequalities_down: List[List[str]]) -> None:
+        """
+        Set up the initial values. The incoming digits are genuine (one-based),
+        not zero-based.
+        """
+        super().set_initial_values(initial_values=initial_values)
+
+        assert len(inequalities_right) == self.n
+        for ineq_right_row in inequalities_right:
+            assert len(ineq_right_row) == self.n - 1
+        self.inequalities_right = inequalities_right
+
+        assert len(inequalities_down) == self.n - 1
+        for ineq_down_row in inequalities_down:
+            assert len(ineq_down_row) == self.n
+        self.inequalities_down = inequalities_down
+
+    # -------------------------------------------------------------------------
+    # Visuals
+    # -------------------------------------------------------------------------
+
+    def _pstr_cell_sides(self) -> Tuple[int, int]:
+        """
+        We show possibilities in a sx-by-sy box; this function returns ``sx,
+        sy``.
+        """
+        sx = math.ceil(math.sqrt(self.n))
+        sy = math.ceil(self.n / sx)
+        return sx, sy
+
+    def _pstr_value_row_col(self, row_zb: int, col_zb: int, digit_zb: int) \
+            -> Tuple[int, int]:
+        """
+        For __str__(): ``row, col`` (``y, x``) coordinates.
+        """
+        sx, sy = self._pstr_cell_sides()
+        gap = self.VISUAL_INEQ_GAP
+        x_base = col_zb * (sx + gap)
+        y_base = row_zb * (sy + gap)
+        x_offset = digit_zb % sx
+        y_offset = digit_zb // sx
+        return (y_base + y_offset), (x_base + x_offset)
+
+    def _pstr_ineq_down_row_col(self, row_zb: int, col_zb: int) \
+            -> Tuple[int, int]:
+        """
+        For __str__(): coordinates of an inequality between two rows.
+        The cell specified is the upper.
+        """
+        sx, sy = self._pstr_cell_sides()
+        gap = self.VISUAL_INEQ_GAP
+        x_base = col_zb * (sx + gap)
+        y_base = row_zb * (sy + gap)
+        x_offset = sx // 2
+        visual_ineq_pos_y = 1
+        y_offset = sy + visual_ineq_pos_y
+        return (y_base + y_offset), (x_base + x_offset)
+
+    def _pstr_ineq_right_row_col(self, row_zb: int, col_zb: int) \
+            -> Tuple[int, int]:
+        """
+        For __str__(): coordinates of an inequality between two columns.
+        The cell specified is the left.
+        """
+        sx, sy = self._pstr_cell_sides()
+        gap = self.VISUAL_INEQ_GAP
+        x_base = col_zb * (sx + gap)
+        y_base = row_zb * (sy + gap)
+        visual_ineq_pos_x = sx // 2
+        x_offset = sx + visual_ineq_pos_x
+        y_offset = sy // 2 - 1
+        return (y_base + y_offset), (x_base + x_offset)
+
+    def __str__(self) -> str:
+        """
+        Returns a visual representation of possibilities.
+        """
+        sx, sy = self._pstr_cell_sides()
+        gap = self.VISUAL_INEQ_GAP
+        pnx = self.n * (sx + gap) - gap
+        pny = self.n * (sy + gap) - gap
+
+        # Create grid of characters
+        strings = []  # type: List[List[str]]
+        for _ in range(pny):
+            line = []  # type: List[str]
+            for _ in range(pnx):
+                line.append(SPACE)
+            strings.append(line)
+
+        # Data
+        for r in range(self.n):
+            for c in range(self.n):
+                initial_value = self.initial_values_zb[r][c] is not None
+                cell_solved = self.n_possibilities(r, c) == 1
+                for d_zb in range(self.n):
+                    y, x = self._pstr_value_row_col(r, c, d_zb)
+                    if self.possible[r][c][d_zb]:
+                        txt = str(d_zb + 1)
+                    elif initial_value:
+                        txt = DISPLAY_INITIAL
+                    elif cell_solved:
+                        txt = DISPLAY_SOLVED
+                    else:
+                        txt = DISPLAY_UNKNOWN
+                    strings[y][x] = txt
+
+        # Inequalities right
+        for r in range(self.n):
+            for c in range(self.n - 1):
+                y, x = self._pstr_ineq_right_row_col(r, c)
+                strings[y][x] = self.inequalities_right[r][c] or SPACE
+
+        # Inequalities down
+        for r in range(self.n - 1):
+            for c in range(self.n):
+                y, x = self._pstr_ineq_down_row_col(r, c)
+                strings[y][x] = self.inequalities_down[r][c] or SPACE
+
+        # Done
+        return "\n".join("".join(x for x in line) for line in strings)
+
+    # -------------------------------------------------------------------------
+    # Calculation helpers
+    # -------------------------------------------------------------------------
+
+    def iter_cells_less_than(self, row_zb: int, col_zb: int) \
+            -> Generator[Tuple[int, int], None, None]:
+        """
+        Generates ``row, col`` coordinates of cells less than this one.
+        """
+        # Cell above?
+        if (row_zb > 0 and
+                self.inequalities_down[row_zb - 1][col_zb] == TOP_LT_BOTTOM):
+            other = row_zb - 1, col_zb
+            yield other
+            yield from self.iter_cells_less_than(*other)
+        # Cell below?
+        if (row_zb < self.n - 1 and
+                self.inequalities_down[row_zb][col_zb] == BOTTOM_LT_TOP):
+            other = row_zb + 1, col_zb
+            yield other
+            yield from self.iter_cells_less_than(*other)
+        # Cell left?
+        if (col_zb > 0 and
+                self.inequalities_right[row_zb][col_zb - 1] == LEFT_LT_RIGHT):
+            other = row_zb, col_zb - 1
+            yield other
+            yield from self.iter_cells_less_than(*other)
+        # Cell right?
+        if (col_zb < self.n - 1 and
+                self.inequalities_right[row_zb][col_zb] == LEFT_GT_RIGHT):
+            other = row_zb, col_zb + 1
+            yield other
+            yield from self.iter_cells_less_than(*other)
+
+    def iter_cells_greater_than(self, row_zb: int, col_zb: int) \
+            -> Generator[Tuple[int, int], None, None]:
+        """
+        Generates ``row, col`` coordinates of cells greater than this one.
+        """
+        # Cell above?
+        if (row_zb > 0 and
+                self.inequalities_down[row_zb - 1][col_zb] == BOTTOM_LT_TOP):
+            other = row_zb - 1, col_zb
+            yield other
+            yield from self.iter_cells_greater_than(*other)
+        # Cell below?
+        if (row_zb < self.n - 1 and
+                self.inequalities_down[row_zb][col_zb] == TOP_LT_BOTTOM):
+            other = row_zb + 1, col_zb
+            yield other
+            yield from self.iter_cells_greater_than(*other)
+        # Cell left?
+        if (col_zb > 0 and
+                self.inequalities_right[row_zb][col_zb - 1] == LEFT_GT_RIGHT):
+            other = row_zb, col_zb - 1
+            yield other
+            yield from self.iter_cells_greater_than(*other)
+        # Cell right?
+        if (col_zb < self.n - 1 and
+                self.inequalities_right[row_zb][col_zb] == LEFT_LT_RIGHT):
+            other = row_zb, col_zb + 1
+            yield other
+            yield from self.iter_cells_greater_than(*other)
+
+    def n_less_than(self, row_zb: int, col_zb: int) -> int:
+        """
+        Number of other cells that this cell is less than.
+        """
+        return len(list(self.iter_cells_less_than(row_zb, col_zb)))
+
+    def n_greater_than(self, row_zb: int, col_zb: int) -> int:
+        """
+        Number of other cells that this cell is less than.
+        """
+        return len(list(self.iter_cells_greater_than(row_zb, col_zb)))
+
+    def min_digit_zb_possible(self, row_zb: int, col_zb: int) -> int:
+        """
+        The minimum (zero-based!) digit possible.
+        """
+        return min(self.possible_digits(row_zb, col_zb))
+
+    def max_digit_zb_possible(self, row_zb: int, col_zb: int) -> int:
+        """
+        The maximum (zero-based!) digit possible.
+        """
+        return max(self.possible_digits(row_zb, col_zb))
+
+    # -------------------------------------------------------------------------
+    # Tactics
+    # -------------------------------------------------------------------------
+
+    def _eliminate_simple(self) -> bool:
+        """
+        Where a cell is known, eliminate other possibilities in its row, cell,
+        and 3x3 box.
+
+        Returns: improved?
+        """
+        log.debug("Eliminating, simple...")
+        source = "eliminate_simple"
+        improved = False
+        for row in range(self.n):
+            for col in range(self.n):
+                d_possible = self.possible_digits(row, col)
+                if len(d_possible) == 1:
+                    d = d_possible[0]
+                    imp_row = self._eliminate_from_row(row, [col], [d],
+                                                       source=source)
+                    imp_col = self._eliminate_from_col([row], col, [d],
+                                                       source=source)
+                    improved = improved or imp_row or imp_col
+        return improved
+
+    def _eliminate_inequalities(self) -> bool:
+        """
+        Eliminate possibilities in a simple way based on inequalities.
+
+        Returns: improved?
+        """
+        source_b = "eliminate_inequalities, basic"
+        source_r = "eliminate_inequalities, relative"
+        improved = False
+        for row in range(self.n):
+            for col in range(self.n):
+                # -------------------------------------------------------------
+                # "If I'm smaller than 2 others, I can't be 4 or 5."
+                # "If I'm bigger than 2 others, I can't be 1 or 2."
+                # -------------------------------------------------------------
+                ng = self.n_greater_than(row, col)
+                nl = self.n_less_than(row, col)
+                # log.debug(f"row={row + 1}, col={col + 1}, ng={ng}, nl={nl}")
+
+                # e.g. if we are greater than 2 digits (there are 2 digits less
+                # than us), we cannot be the bottom two
+                for d_zb in range(0, nl):
+                    improved = self._eliminate_from_cell(
+                        row, col, d_zb, source=source_b) or improved
+                # e.g. if we are less than 2 digits (there are 2 digits greater
+                # than us), we cannot be the top two
+                for d_zb in range(self.n - ng, self.n):
+                    improved = self._eliminate_from_cell(
+                        row, col, d_zb, source=source_b) or improved
+
+                # -------------------------------------------------------------
+                # "I must be smaller than the minimum possible values of all
+                # cells that I am smaller than."
+                # "I must be bigger (etc.)..."
+                # -------------------------------------------------------------
+                max_of_bigger_cells = [
+                    self.max_digit_zb_possible(bigger_row, bigger_col)
+                    for bigger_row, bigger_col in
+                    self.iter_cells_greater_than(row, col)
+                ]
+                i_am_smaller_than = (
+                    max(max_of_bigger_cells) if max_of_bigger_cells
+                    else self.n
+                )
+                min_of_smaller_cells = [
+                    self.min_digit_zb_possible(smaller_row, smaller_col)
+                    for smaller_row, smaller_col in
+                    self.iter_cells_less_than(row, col)
+                ]
+                i_am_bigger_than = (
+                    min(min_of_smaller_cells) if min_of_smaller_cells
+                    else -1
+                )
+                # log.debug(
+                #     f"row={row + 1}, col={col + 1}: "
+                #     f"i_am_smaller_than={i_am_smaller_than + 1}, "
+                #     f"i_am_bigger_than={i_am_bigger_than + 1}")
+                for d_zb in range(self.n):
+                    if d_zb >= i_am_smaller_than or d_zb <= i_am_bigger_than:
+                        improved = self._eliminate_from_cell(
+                            row, col, d_zb, source=source_r) or improved
+
+        return improved
+
+    def _find_only_possibilities(self) -> bool:
+        """
+        Where there is only one location for a digit in a row, cell, or box,
+        assign it.
+        """
+        improved = False
+        for d in range(self.n):
+            # Rows
+            for r in range(self.n):
+                possible_cols = [c for c in range(self.n)
+                                 if self.possible[r][c][d]]
+                if len(possible_cols) == 1:
+                    source = (
+                        f"Only possibility for digit {d + 1} in row {r + 1}")
+                    improved = self.assign_digit(
+                        r, possible_cols[0], d, source=source) or improved
+            # Columns
+            for c in range(self.n):
+                possible_rows = [r for r in range(self.n)
+                                 if self.possible[r][c][d]]
+                if len(possible_rows) == 1:
+                    source = (
+                        f"Only possibility for digit {d + 1} "
+                        f"in column {c + 1}")
+                    improved = self.assign_digit(
+                        possible_rows[0], c, d, source=source) or improved
+        return improved
+
+    # -------------------------------------------------------------------------
+    # Strategy
+    # -------------------------------------------------------------------------
+
+    def eliminate(self) -> bool:
+        """
+        Eliminates the impossible.
+
+        Returns: improved?
+        """
+        improved = self._eliminate_simple()
+        improved = self._eliminate_inequalities()
+        improved = self._find_only_possibilities() or improved
+        if improved:
+            return improved  # Keep it simple...
+
+        # *** more
+
+        return improved
+
+    def solve(self) -> None:
+        """
+        Solves by elimination.
+        """
+        iteration = 0
+        while not self.solved():
+            log.debug(
+                f"Iteration {iteration}. "
+                f"Unsolved cells: {self.n_unknown_cells()}. "
+                f"Possible digit assignments: "
+                f"{self.n_possibilities_overall()} "
+                f"(target {self.n * self.n}). "
+                f"Possibilities:\n{self}")
+            improved = self.eliminate()
+            if not improved:
+                self.note("No improvement; would need to guess")
+                log.debug(f"Possibilities:\n{self}")
+                self.guess()
+            iteration += 1
+
+    def guess(self) -> None:
+        assert False, "Don't guess yet"
 
 
 # =============================================================================
@@ -103,12 +522,12 @@ class Futoshiki(object):
         self.solved = False
         self.problem_data = [
             [
-                UNKNOWN_STR for _col_zb in range(n)
+                UNKNOWN for _col_zb in range(n)
             ] for _row_zb in range(n)
         ]
         self.solution_data = [
             [
-                UNKNOWN_STR for _col_zb in range(n)
+                UNKNOWN for _col_zb in range(n)
             ] for _row_zb in range(n)
         ]
         self.inequality_right = [
@@ -168,7 +587,7 @@ class Futoshiki(object):
                 self.problem_data[row_zb][col_zb] = cell_data[col_zb]
                 if col_zb < n - 1 and col_zb < len(cell_ineq):
                     ineq = cell_ineq[col_zb]
-                    assert ineq in (LT, GT, SPACE), (
+                    assert ineq in (LEFT_LT_RIGHT, LEFT_GT_RIGHT, SPACE), (
                         f"Bad horizontal inequality: {ineq!r}"
                     )
                     if ineq != SPACE:
@@ -298,9 +717,9 @@ class Futoshiki(object):
         for r in range(n):
             for c in range(n - 1):
                 ineq = self.inequality_right[r][c]
-                if ineq == LT:
+                if ineq == LEFT_LT_RIGHT:
                     implement_less_than(r, c, r, c + 1)
-                elif ineq == GT:
+                elif ineq == LEFT_GT_RIGHT:
                     implement_less_than(r, c + 1, r, c)
         # Vertical inequalities
         for r in range(n - 1):
@@ -313,7 +732,7 @@ class Futoshiki(object):
         # Starting values
         for r in range(n):
             for c in range(n):
-                if self.problem_data[r][c] != UNKNOWN_STR:
+                if self.problem_data[r][c] != UNKNOWN:
                     d_zb = int(self.problem_data[r][c]) - 1
                     m += x[r][c][d_zb] == 1
 
@@ -335,6 +754,48 @@ class Futoshiki(object):
                         if x[r][c][d_zb].x > ALMOST_ONE:
                             self.solution_data[r][c] = str(d_zb + 1)
                             break
+
+    # -------------------------------------------------------------------------
+    # Solve via puzzle logic and show working
+    # -------------------------------------------------------------------------
+
+    def solve_logic(self) -> None:
+        """
+        Solve via conventional logic, and save our working.
+        """
+        if self.solved:
+            log.info("Already solved")
+            return
+
+        p = FutoshikiPossibilities(n=self.n)  # start from scratch
+
+        # Set starting values.
+        n = self.n
+        initial_values = [
+            [
+                None for _c in range(n)
+            ] for _r in range(n)
+        ]  # type: List[List[Optional[int]]]
+        for r in range(n):
+            for c in range(n):
+                known_digit_str = self.problem_data[r][c]
+                if known_digit_str != UNKNOWN:
+                    initial_values[r][c] = int(known_digit_str)
+        p.set_initial_values(
+            initial_values=initial_values,
+            inequalities_down=self.inequality_down,
+            inequalities_right=self.inequality_right,
+        )
+
+        # Eliminate and iterate
+        p.solve()
+
+        # Read out answers
+        self.solved = True
+        for r in range(n):
+            for c in range(n):
+                d_zb = next(i for i, v in enumerate(p.possible[r][c]) if v)
+                self.solution_data[r][c] = str(d_zb + 1)
 
 
 # =============================================================================

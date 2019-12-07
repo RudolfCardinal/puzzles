@@ -24,21 +24,64 @@ sudoku.py
 
 **Solves Sudoku puzzles.**
 
+It uses two approaches:
+
+- Integer programming, which is close to magic.
+  You say "here are my constraints; go" and a few milliseconds later you have
+  a valid answer.
+
+- Tedious logic, like a human would do.
+  Note that there are a large variety of these from a human's perspective
+  (though only the simplest are required for the majority of puzzles
+  encountered in the wild); see e.g. http://www.sudokusnake.com/techniques.php.
+
+- Sudoku Snake technique names currently implemented:
+
+  - Beginner:
+
+    - Hidden Singles
+    - Hidden Singles by Box
+    - Naked Singles
+    - Pointing
+    - *** TO DO: Claiming
+
+  - Intermediate
+
+    - Hidden Subsets
+    - Naked Subsets
+
+  - Advanced
+
+  - Master
+
+  - Ludicrous
+
 """
 
 
 import argparse
-from copy import deepcopy
 from itertools import combinations
 import logging
 import sys
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 from cardinal_pythonlib.argparse_func import RawDescriptionArgumentDefaultsHelpFormatter  # noqa
 from cardinal_pythonlib.logs import main_only_quicksetup_rootlogger
 from mip import BINARY, Model, xsum
 
-from common import debug_model_constraints, debug_model_vars
+from puzzles.common import (
+    ALMOST_ONE,
+    CommonPossibilities,
+    debug_model_constraints,
+    debug_model_vars,
+    DISPLAY_INITIAL,
+    DISPLAY_SOLVED,
+    DISPLAY_UNKNOWN,
+    HASH,
+    NEWLINE,
+    SPACE,
+    UNKNOWN,
+)
 
 log = logging.getLogger(__name__)
 
@@ -47,15 +90,6 @@ log = logging.getLogger(__name__)
 # Constants
 # =============================================================================
 
-UNKNOWN = "."
-NEWLINE = "\n"
-SPACE = " "
-COMMENT = "#"
-HASH = "#"
-DISPLAY_INITIAL = "■"
-DISPLAY_UNKNOWN = "·"
-DISPLAY_SOLVED = "♦"
-ALMOST_ONE = 0.99
 N = 9
 T = 3
 
@@ -77,18 +111,10 @@ DEMO_SUDOKU_1 = """
 
 
 # =============================================================================
-# Exceptions
-# =============================================================================
-
-class SolutionFailure(Exception):
-    pass
-
-
-# =============================================================================
 # SudokuPossibilities
 # =============================================================================
 
-class SudokuPossibilities(object):
+class SudokuPossibilities(CommonPossibilities):
     """
     Represents Sudoku possibilities, for a logic-based eliminator.
 
@@ -110,10 +136,10 @@ class SudokuPossibilities(object):
         location or cell.
 
     2.  Where a digit is known, eliminate it as a possibility from other cells
-        in the same row/column/3x3 square.
+        in the same row/column/3x3 box.
 
     3.  Where there is only one possible cell for a digit in a
-        row/column/square, confirm that digit by eliminating other possible
+        row/column/box, confirm that digit by eliminating other possible
         digits from that cell.
 
     4.  Where there are n identical sets of n possible locations for n digits
@@ -130,27 +156,7 @@ class SudokuPossibilities(object):
         """
         Initialize with "everything is possible", or copy from another.
         """
-        self.guess_level = 0
-        if other:
-            self.initial_values_zb = deepcopy(other.initial_values_zb)
-            self.possible = deepcopy(other.possible)
-            self.working = deepcopy(other.working)
-        else:
-            self.initial_values_zb = [
-                [
-                    None for _c in range(N)
-                ] for _r in range(N)
-            ]  # type: List[List[Optional[int]]]
-            # ... index as: self.initial[row_zb][col_zb]
-            self.possible = [
-                [
-                    [
-                        True for _d in range(N)
-                    ] for _c in range(N)
-                ] for _r in range(N)
-            ]  # type: List[List[List[bool]]]
-            # ... index as: self.possible[row_zb][col_zb][digit_zb]
-            self.working = []  # type: List[str]
+        super().__init__(other=other, n=N)
 
     # -------------------------------------------------------------------------
     # Setup
@@ -162,29 +168,11 @@ class SudokuPossibilities(object):
         Set up the initial values. The incoming digits are genuine (one-based),
         not zero-based.
         """
-        assert len(initial_values) == N
-        for r in range(N):
-            row = initial_values[r]
-            assert len(row) == N
-            for c in range(N):
-                value = row[c]
-                if value is not None:
-                    d_zb = value - 1
-                    self.initial_values_zb[r][c] = d_zb
-                    self.assign_digit(r, c, d_zb, source="Starting value")
-                else:
-                    self.initial_values_zb[r][c] = None
+        super().set_initial_values(initial_values=initial_values)
 
     # -------------------------------------------------------------------------
     # Visuals
     # -------------------------------------------------------------------------
-
-    def note(self, msg: str) -> None:
-        """
-        Save some working.
-        """
-        self.working.append(msg)
-        log.info(msg)
 
     @staticmethod
     def _pstr_row_col(row_zb: int, col_zb: int, digit_zb: int) \
@@ -212,7 +200,7 @@ class SudokuPossibilities(object):
         for _ in range(pn):
             line = []  # type: List[str]
             for _ in range(pn):
-                line.append(" ")
+                line.append(SPACE)
             strings.append(line)
 
         # Prettify
@@ -249,57 +237,11 @@ class SudokuPossibilities(object):
     # Calculation helpers
     # -------------------------------------------------------------------------
 
-    def n_unknown_cells(self) -> int:
-        """
-        Number of unsolved cells. Maximum is 81.
-        """
-        return sum(
-            1 if self.n_possibilities(r, c) != 1 else 0
-            for r in range(N)
-            for c in range(N)
-        )
-
-    def n_possibilities_overall(self) -> int:
-        """
-        Number of row/cell/digit possibilities overall.
-        Minimum is 81 (solved). Maximum is 729.
-        """
-        return sum(
-            self.n_possibilities(r, c)
-            for r in range(N)
-            for c in range(N)
-        )
-
-    def n_possibilities(self, row_zb: int, col_zb: int) -> int:
-        """
-        Number of possible digits for a cell.
-        """
-        return sum(self.possible[row_zb][col_zb])
-
-    def possible_digits(self, row_zb: int, col_zb: int) -> List[int]:
-        """
-        Returns possible digits, in ZERO-BASED format, for a given cell.
-        They are always returned in ascending order.
-        """
-        return list(
-            d for d, v in enumerate(self.possible[row_zb][col_zb]) if v
-        )
-
-    def solved(self) -> bool:
-        """
-        Are we there yet?
-        """
-        for r in range(N):
-            for c in range(N):
-                if self.n_possibilities(r, c) != 1:
-                    return False
-        return True
-
     @staticmethod
-    def square_extremes_for_cell(row_zb: int, col_zb: int) \
+    def box_extremes_for_cell(row_zb: int, col_zb: int) \
             -> Tuple[int, int, int, int]:
         """
-        Defines the boundaries of the 3x3 square containing a particular cell.
+        Defines the boundaries of the 3x3 box containing a particular cell.
 
         Returns ``row_min, row_max, col_min, col_max``.
         """
@@ -310,153 +252,58 @@ class SudokuPossibilities(object):
         return row_min, row_max, col_min, col_max
 
     @staticmethod
-    def top_left_cell_for_square(square_zb: int) -> Tuple[int, int]:
+    def top_left_cell_for_box(box_zb: int) -> Tuple[int, int]:
         """
-        Returns ``row_zb, col_zb`` for the top-left cell in a 3x3 square
+        Returns ``row_zb, col_zb`` for the top-left cell in a 3x3 box
         (numbered from 0 to N - 1).
         """
-        row = (square_zb // T) * T
-        col = (square_zb % T) * T
+        row = (box_zb // T) * T
+        col = (box_zb % T) * T
         return row, col
 
     @classmethod
-    def square_extremes_for_square(cls, square_zb: int) \
+    def extremes_for_box(cls, box_zb: int) \
             -> Tuple[int, int, int, int]:
         """
-        Defines the boundaries of the 3x3 square, numbered from 0 to (N - 1).
+        Defines the boundaries of the 3x3 box, numbered from 0 to (N - 1).
 
         Returns ``row_min, row_max, col_min, col_max``.
         """
-        row, col = cls.top_left_cell_for_square(square_zb)
-        return cls.square_extremes_for_cell(row, col)
+        row, col = cls.top_left_cell_for_box(box_zb)
+        return cls.box_extremes_for_cell(row, col)
+
+    @staticmethod
+    def box_description(box_zb: int) -> str:
+        """
+        Coordinate-based description for a 3x3 box.
+        """
+        boxrow = box_zb // 3 + 1
+        boxcol = box_zb % 3 + 1
+        return f"[{boxrow},{boxcol}]"
 
     # -------------------------------------------------------------------------
     # Computations
     # -------------------------------------------------------------------------
 
-    def assign_digit(self, row_zb: int, col_zb: int, digit_zb: int,
-                     source: str = "?") -> bool:
-        """
-        Assign a digit to a cell.
-
-        Returns: improved?
-        """
-        improved = False
-        for d in range(N):
-            if d == digit_zb:
-                assert self.possible[row_zb][col_zb][d], (
-                    f"{source}: Assigning digit {digit_zb + 1} to "
-                    f"row={row_zb + 1}, col={col_zb + 1} "
-                    f"where that is known to be impossible"
-                )
-            else:
-                improved = improved or self.possible[row_zb][col_zb][d]
-                self.possible[row_zb][col_zb][d] = False
-        if improved:
-            self.note(f"{source}: Assigning digit {digit_zb + 1} to "
-                      f"row={row_zb + 1}, col={col_zb + 1}")
-        return improved
-
-    def _restrict_cells(self, cells: Sequence[Tuple[int, int]],
-                        digits_zb_to_keep: Sequence[int],
-                        source: str = "?") -> bool:
-        """
-        Restricts a cell or cells to a specific set of digits.
-        Cells are specified as ``row_zb, col_zb`` tuples.
-        Digits are also zero-based.
-        """
-        improved = False
-        for row, col in cells:
-            initial_n = self.n_possibilities(row, col)
-            for d in range(N):
-                if d in digits_zb_to_keep:
-                    continue
-            final_n = self.n_possibilities(row, col)
-            if final_n == 0:
-                raise SolutionFailure()
-            this_cell_improved = final_n < initial_n
-            if this_cell_improved and final_n == 1:  # unlikely!
-                self.note(f"{source}: "
-                          f"row={row + 1}, col={col + 1} must be "
-                          f"{self.possible_digits(row, col)[0] + 1}")
-            improved = improved or this_cell_improved
-        return improved
-
-    def _eliminate_from_cell(self, row_zb: int, col_zb: int,
-                             digit_zb: int, source: str = "?") -> bool:
-        """
-        Eliminates a digit as a possibility from a cell.
-        Returns: improved?
-        """
-        if not self.possible[row_zb][col_zb][digit_zb]:
-            return False
-        self.possible[row_zb][col_zb][digit_zb] = False
-        n = self.n_possibilities(row_zb, col_zb)
-        if n == 0:
-            raise SolutionFailure()
-        if n == 1:  # improved down to 1
-            self.note(f"{source}: "
-                      f"row={row_zb + 1}, col={col_zb + 1} must be "
-                      f"{self.possible_digits(row_zb, col_zb)[0] + 1}")
-        return True
-
-    def _eliminate_from_row(self, row_zb: int, except_cols_zb: List[int],
+    def _eliminate_from_box(self, except_cells_zb: List[Tuple[int, int]],
                             digits_zb_to_eliminate: Iterable[int],
                             source: str = "?") -> bool:
         """
-        Eliminates a digit or digits from all cells in a row except the one(s)
-        specified.
-
-        Returns: Improved?
-        """
-        improved = False
-        for c in range(N):
-            if c in except_cols_zb:
-                continue
-            for d in digits_zb_to_eliminate:
-                zsource = f"{source}: eliminate_from_row, eliminating {d + 1}"
-                improved = self._eliminate_from_cell(
-                    row_zb, c, d, source=zsource) or improved
-        return improved
-
-    def _eliminate_from_col(self, except_rows_zb: List[int], col_zb: int,
-                            digits_zb_to_eliminate: Iterable[int],
-                            source: str = "?") -> bool:
-        """
-        Eliminates a digit or digits from all cells in a column except the
-        one(s) specified.
-
-        Returns: Improved?
-        """
-        improved = False
-        for r in range(N):
-            if r in except_rows_zb:
-                continue
-            for d in digits_zb_to_eliminate:
-                zsource = f"{source}: eliminate_from_col, eliminating {d + 1}"
-                improved = self._eliminate_from_cell(
-                    r, col_zb, d, source=zsource) or improved
-        return improved
-
-    def _eliminate_from_square(self, except_cells_zb: List[Tuple[int, int]],
-                               digits_zb_to_eliminate: Iterable[int],
-                               source: str = "?") -> bool:
-        """
-        Eliminates a digit or digits from all cells in a 3x3 "square" except
+        Eliminates a digit or digits from all cells in a 3x3 "box" except
         the cell(s) specified.
 
         Returns: Improved?
         """
-        row_min, row_max, col_min, col_max = self.square_extremes_for_cell(
+        row_min, row_max, col_min, col_max = self.box_extremes_for_cell(
             row_zb=min(t[0] for t in except_cells_zb),
             col_zb=min(t[1] for t in except_cells_zb)
         )
         assert (row_min, row_max, col_min, col_max) == (
-            self.square_extremes_for_cell(
+            self.box_extremes_for_cell(
                 row_zb=max(t[0] for t in except_cells_zb),
                 col_zb=max(t[1] for t in except_cells_zb)
             )
-        ), "except_cells_zb spans more than one 3x3 square!"
+        ), "except_cells_zb spans more than one 3x3 box!"
         improved = False
         for r in range(row_min, row_max + 1):
             for c in range(col_min, col_max + 1):
@@ -464,16 +311,20 @@ class SudokuPossibilities(object):
                     continue
                 for d in digits_zb_to_eliminate:
                     zsource = (
-                        f"{source}: eliminate_from_square, eliminating {d + 1}"
+                        f"{source}: eliminate_from_box, eliminating {d + 1}"
                     )
                     improved = self._eliminate_from_cell(
                         r, c, d, source=zsource) or improved
         return improved
 
+    # -------------------------------------------------------------------------
+    # Tactics
+    # -------------------------------------------------------------------------
+
     def _eliminate_simple(self) -> bool:
         """
         Where a cell is known, eliminate other possibilities in its row, cell,
-        and 3x3 square.
+        and 3x3 box.
 
         Returns: improved?
         """
@@ -489,35 +340,42 @@ class SudokuPossibilities(object):
                                                        source=source)
                     imp_col = self._eliminate_from_col([row], col, [d],
                                                        source=source)
-                    imp_square = self._eliminate_from_square([(row, col)], [d],
-                                                             source=source)
-                    improved = improved or imp_row or imp_col or imp_square
+                    imp_box = self._eliminate_from_box([(row, col)], [d],
+                                                       source=source)
+                    improved = improved or imp_row or imp_col or imp_box
         return improved
 
     def _find_only_possibilities(self) -> bool:
         """
-        Where there is only one location for a digit in a row, cell, or square,
+        Where there is only one location for a digit in a row, cell, or box,
         assign it.
         """
         improved = False
         for d in range(N):
-            source = f"find_only_possibilities, digit={d + 1}"
             # Rows
+            # Sudoku Snake: "Hidden Singles".
             for r in range(N):
                 possible_cols = [c for c in range(N) if self.possible[r][c][d]]
                 if len(possible_cols) == 1:
+                    source = (
+                        f"Only possibility for digit {d + 1} in row {r + 1}")
                     improved = self.assign_digit(
                         r, possible_cols[0], d, source=source) or improved
             # Columns
+            # Sudoku Snake: "Hidden Singles".
             for c in range(N):
                 possible_rows = [r for r in range(N) if self.possible[r][c][d]]
                 if len(possible_rows) == 1:
+                    source = (
+                        f"Only possibility for digit {d + 1} "
+                        f"in column {c + 1}")
                     improved = self.assign_digit(
                         possible_rows[0], c, d, source=source) or improved
-            # Squares
-            for s in range(N):
+            # Boxes
+            # Sudoku Snake: "Hidden Singles By Box".
+            for b in range(N):
                 row_min, row_max, col_min, col_max = \
-                    self.square_extremes_for_square(s)
+                    self.extremes_for_box(b)
                 possible_cells = [
                     (r, c)
                     for r in range(row_min, row_max + 1)
@@ -525,6 +383,9 @@ class SudokuPossibilities(object):
                     if self.possible[r][c][d]
                 ]
                 if len(possible_cells) == 1:
+                    source = (
+                        f"Only possibility for digit {d + 1} "
+                        f"in box {self.box_description(b)}")
                     improved = self.assign_digit(
                         possible_cells[0][0],
                         possible_cells[0][1], d, source=source) or improved
@@ -532,22 +393,23 @@ class SudokuPossibilities(object):
 
     def _eliminate_constraintwise(self) -> bool:
         """
-        Example: if we don't know where the 5 is in a particular 3x3 square,
+        Example: if we don't know where the 5 is in a particular 3x3 box,
         but we know that it's in the first row, then we can eliminate "5" from
         that row in all other cells.
 
         Returns: improved?
         """
+        # Sudoku Snake: "Pointing".
         log.debug(f"Eliminating, constraint-wise...")
         improved = False
-        for s in range(N):
+        for b in range(N):
             row_min, row_max, col_min, col_max = \
-                self.square_extremes_for_square(s)
+                self.extremes_for_box(b)
             rownums = list(range(row_min, row_max + 1))
             colnums = list(range(col_min, col_max + 1))
             for d in range(N):
                 source = (
-                    f"eliminate_constraintwise from square {s + 1}, "
+                    f"eliminate_constraintwise from box {b + 1}, "
                     f"eliminating {d + 1}"
                 )
                 possible_cells_for_digit = [
@@ -579,7 +441,7 @@ class SudokuPossibilities(object):
     def _eliminate_groupwise(self, groupsize: int) -> bool:
         """
         Scan through all numbers in groups of n. If there are exactly n
-        possible cells for each of those n numbers in a row/column/square, and
+        possible cells for each of those n numbers in a row/column/box, and
         those possibilities are all the same, eliminate other possible digits
         for those cells.
 
@@ -595,6 +457,8 @@ class SudokuPossibilities(object):
 
         Returns: improved?
         """
+        # Sudoku Snake: "Hidden Subsets" (restricting affected cells).
+        # Sudoku Snake: "Naked Subsets" (eliminating from other cells).
         log.debug(f"Eliminating, groupwise, group size {groupsize}...")
         improved = False
         for digit_combo in combinations(range(N), r=groupsize):
@@ -657,10 +521,10 @@ class SudokuPossibilities(object):
                         digits_zb_to_keep=digit_combo,
                         source=source
                     ) or improved
-            # Squares
-            for square in range(N):
+            # Boxes
+            for box in range(N):
                 row_min, row_max, col_min, col_max = \
-                    self.square_extremes_for_square(square)
+                    self.extremes_for_box(box)
                 cells_with_only_these_digits = [
                     (row, col)
                     for row in range(row_min, row_max + 1)
@@ -678,10 +542,10 @@ class SudokuPossibilities(object):
                     prettycell = [(r + 1, c+1)
                                   for r, c in cells_with_only_these_digits]
                     log.debug(
-                        f"In 3x3 square #{square + 1}, "
+                        f"In 3x3 box #{self.box_description(box)}, "
                         f"only cells {prettycell} "
                         f"could contain digits {pretty_digits}")
-                    improved = self._eliminate_from_square(
+                    improved = self._eliminate_from_box(
                         except_cells_zb=cells_with_only_these_digits,
                         digits_zb_to_eliminate=digit_combo,
                         source=source
@@ -692,6 +556,10 @@ class SudokuPossibilities(object):
                         source=source
                     ) or improved
         return improved
+
+    # -------------------------------------------------------------------------
+    # Strategy
+    # -------------------------------------------------------------------------
 
     def eliminate(self) -> bool:
         """
@@ -714,55 +582,6 @@ class SudokuPossibilities(object):
                 return improved
 
         return improved
-
-    def solve(self) -> None:
-        """
-        Solves by elimination.
-        """
-        iteration = 0
-        while not self.solved():
-            log.debug(
-                f"Iteration {iteration}. "
-                f"Unsolved cells: {self.n_unknown_cells()}. "
-                f"Possible digit assignments: "
-                f"{self.n_possibilities_overall()} (target {N * N}). "
-                f"Possibilities:\n{self}")
-            improved = self.eliminate()
-            if not improved:
-                self.note("No improvement; guessing")
-                log.debug(f"Possibilities:\n{self}")
-                self.guess()
-            iteration += 1
-
-    def guess(self) -> None:
-        """
-        Implements the "guess" method!
-
-        Using this means that the algorithm has deficiencies (or the puzzle
-        does).
-        """
-        for r in range(N):
-            for c in range(N):
-                digits = self.possible_digits(r, c)
-                if len(digits) == 1:
-                    continue
-                for d in digits:
-                    p = SudokuPossibilities(self)
-                    p.guess_level = self.guess_level + 1
-                    log.warning("Guessing")
-                    p.assign_digit(r, c, d,
-                                   source=f"guess level {p.guess_level}")
-                    try:
-                        p.solve()
-                        assert p.solved()
-                        log.info(f"Guess level {p.guess_level} was good")
-                        # no need to copy initial_values_zb
-                        self.possible = p.possible
-                        self.working = p.working
-                        return
-                    except SolutionFailure:
-                        log.info(
-                            f"Bad guess at level {p.guess_level}; moving on")
 
 
 # =============================================================================
@@ -900,12 +719,12 @@ class Sudoku(object):
             # One of each digit per column
             for c in range(N):
                 m += xsum(x[r][c][d] for r in range(N)) == 1
-        # One of each digit in each 3x3 square:
+        # One of each digit in each 3x3 box:
         for d in range(N):
-            for square_row in range(T):
-                for square_col in range(T):
-                    row_base = square_row * T
-                    col_base = square_col * T
+            for box_row in range(T):
+                for box_col in range(T):
+                    row_base = box_row * T
+                    col_base = box_col * T
                     m += xsum(
                         x[row_base + row_offset][col_base + col_offset][d]
                         for row_offset in range(T)

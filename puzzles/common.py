@@ -26,11 +26,35 @@ Common constants and functions for the puzzle solvers.
 
 """
 
+from copy import deepcopy
 import logging
+from typing import List, Iterable, Optional, Sequence, Tuple
 
 from mip import Constr, Model, Var
 
 log = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+UNKNOWN = "."
+NEWLINE = "\n"
+SPACE = " "
+HASH = "#"
+DISPLAY_INITIAL = "■"
+DISPLAY_UNKNOWN = "·"
+DISPLAY_SOLVED = "♦"
+ALMOST_ONE = 0.99
+
+
+# =============================================================================
+# Exceptions
+# =============================================================================
+
+class SolutionFailure(Exception):
+    pass
 
 
 # =============================================================================
@@ -55,3 +79,306 @@ def debug_model_vars(m: Model) -> None:
     for v in m.vars:  # type: Var
         lines.append(f"{v.name} == {v.x}")
     log.debug("\n".join(lines))
+
+
+# =============================================================================
+# CommonPossibilities
+# =============================================================================
+
+class CommonPossibilities(object):
+    def __init__(self, other: "CommonPossibilities" = None,
+                 n: int = 5) -> None:
+        """
+        Initialize with "everything is possible", or copy from another.
+        """
+        self.n = n
+        if other:
+            assert other.n == self.n
+            self.guess_level = other.guess_level
+            self.initial_values_zb = deepcopy(other.initial_values_zb)
+            self.possible = deepcopy(other.possible)
+            self.working = deepcopy(other.working)
+        else:
+            self.guess_level = 0
+            self.initial_values_zb = [
+                [
+                    None for _c in range(n)
+                ] for _r in range(n)
+            ]  # type: List[List[Optional[int]]]
+            # ... index as: self.initial[row_zb][col_zb]
+            self.possible = [
+                [
+                    [
+                        True for _d in range(n)
+                    ] for _c in range(n)
+                ] for _r in range(n)
+            ]  # type: List[List[List[bool]]]
+            # ... index as: self.possible[row_zb][col_zb][digit_zb]
+            self.working = []  # type: List[str]
+
+    # -------------------------------------------------------------------------
+    # Setup
+    # -------------------------------------------------------------------------
+
+    def set_initial_values(self,
+                           initial_values: List[List[Optional[int]]]) -> None:
+        """
+        Set up the initial values. The incoming digits are genuine (one-based),
+        not zero-based.
+        """
+        assert len(initial_values) == self.n
+        for r in range(self.n):
+            row = initial_values[r]
+            assert len(row) == self.n
+            for c in range(self.n):
+                value = row[c]
+                if value is not None:
+                    d_zb = value - 1
+                    self.initial_values_zb[r][c] = d_zb
+                    self.assign_digit(r, c, d_zb, source="Starting value")
+                else:
+                    self.initial_values_zb[r][c] = None
+
+    # -------------------------------------------------------------------------
+    # Show your working
+    # -------------------------------------------------------------------------
+
+    def note(self, msg: str) -> None:
+        """
+        Save some working.
+        """
+        self.working.append(msg)
+        log.info(msg)
+
+    # -------------------------------------------------------------------------
+    # Calculation helpers
+    # -------------------------------------------------------------------------
+
+    def n_unknown_cells(self) -> int:
+        """
+        Number of unsolved cells. Maximum is 81.
+        """
+        return sum(
+            1 if self.n_possibilities(r, c) != 1 else 0
+            for r in range(self.n)
+            for c in range(self.n)
+        )
+
+    def n_possibilities_overall(self) -> int:
+        """
+        Number of row/cell/digit possibilities overall.
+        Minimum is n^2 (solved). Maximum is n^3.
+        """
+        return sum(
+            self.n_possibilities(r, c)
+            for r in range(self.n)
+            for c in range(self.n)
+        )
+
+    def n_possibilities(self, row_zb: int, col_zb: int) -> int:
+        """
+        Number of possible digits for a cell.
+        """
+        return sum(self.possible[row_zb][col_zb])
+
+    def possible_digits(self, row_zb: int, col_zb: int) -> List[int]:
+        """
+        Returns possible digits, in ZERO-BASED format, for a given cell.
+        They are always returned in ascending order.
+        """
+        return list(
+            d for d, v in enumerate(self.possible[row_zb][col_zb]) if v
+        )
+
+    def solved(self) -> bool:
+        """
+        Are we there yet?
+        """
+        for r in range(self.n):
+            for c in range(self.n):
+                if self.n_possibilities(r, c) != 1:
+                    return False
+        return True
+
+    # -------------------------------------------------------------------------
+    # Computations
+    # -------------------------------------------------------------------------
+
+    def assign_digit(self, row_zb: int, col_zb: int, digit_zb: int,
+                     source: str = "?") -> bool:
+        """
+        Assign a digit to a cell.
+
+        Returns: improved?
+        """
+        improved = False
+        for d in range(self.n):
+            if d == digit_zb:
+                assert self.possible[row_zb][col_zb][d], (
+                    f"{source}: Assigning digit {digit_zb + 1} to "
+                    f"(row={row_zb + 1}, col={col_zb + 1}) "
+                    f"where that is known to be impossible"
+                )
+            else:
+                improved = improved or self.possible[row_zb][col_zb][d]
+                self.possible[row_zb][col_zb][d] = False
+        if improved:
+            self.note(f"{source}: Assigning digit {digit_zb + 1} to "
+                      f"(row={row_zb + 1}, col={col_zb + 1})")
+        return improved
+
+    def _restrict_cells(self, cells: Sequence[Tuple[int, int]],
+                        digits_zb_to_keep: Sequence[int],
+                        source: str = "?") -> bool:
+        """
+        Restricts a cell or cells to a specific set of digits.
+        Cells are specified as ``row_zb, col_zb`` tuples.
+        Digits are also zero-based.
+        """
+        improved = False
+        for row, col in cells:
+            initial_n = self.n_possibilities(row, col)
+            for d in range(self.n):
+                if d in digits_zb_to_keep:
+                    continue
+            final_n = self.n_possibilities(row, col)
+            if final_n == 0:
+                raise SolutionFailure()
+            this_cell_improved = final_n < initial_n
+            if this_cell_improved and final_n == 1:  # unlikely!
+                self.note(f"{source}: "
+                          f"(row={row + 1}, col={col + 1}) must be "
+                          f"{self.possible_digits(row, col)[0] + 1}")
+            improved = improved or this_cell_improved
+        return improved
+
+    def _eliminate_from_cell(self, row_zb: int, col_zb: int,
+                             digit_zb: int, source: str = "?") -> bool:
+        """
+        Eliminates a digit as a possibility from a cell.
+        Returns: improved?
+        """
+        if not self.possible[row_zb][col_zb][digit_zb]:
+            return False
+        self.possible[row_zb][col_zb][digit_zb] = False
+        n = self.n_possibilities(row_zb, col_zb)
+        if n == 0:
+            raise SolutionFailure()
+        if n == 1:  # improved down to 1
+            # Sudoku Snake: "Naked Singles".
+            self.note(f"{source}: "
+                      f"(row={row_zb + 1}, col={col_zb + 1}) must be "
+                      f"{self.possible_digits(row_zb, col_zb)[0] + 1}")
+        return True
+
+    def _eliminate_from_row(self, row_zb: int, except_cols_zb: List[int],
+                            digits_zb_to_eliminate: Iterable[int],
+                            source: str = "?") -> bool:
+        """
+        Eliminates a digit or digits from all cells in a row except the one(s)
+        specified.
+
+        Returns: Improved?
+        """
+        improved = False
+        for c in range(self.n):
+            if c in except_cols_zb:
+                continue
+            for d in digits_zb_to_eliminate:
+                zsource = f"{source}: eliminate_from_row, eliminating {d + 1}"
+                improved = self._eliminate_from_cell(
+                    row_zb, c, d, source=zsource) or improved
+        return improved
+
+    def _eliminate_from_col(self, except_rows_zb: List[int], col_zb: int,
+                            digits_zb_to_eliminate: Iterable[int],
+                            source: str = "?") -> bool:
+        """
+        Eliminates a digit or digits from all cells in a column except the
+        one(s) specified.
+
+        Returns: Improved?
+        """
+        improved = False
+        for r in range(self.n):
+            if r in except_rows_zb:
+                continue
+            for d in digits_zb_to_eliminate:
+                zsource = f"{source}: eliminate_from_col, eliminating {d + 1}"
+                improved = self._eliminate_from_cell(
+                    r, col_zb, d, source=zsource) or improved
+        return improved
+
+    # -------------------------------------------------------------------------
+    # Strategy
+    # -------------------------------------------------------------------------
+
+    def eliminate(self) -> bool:
+        """
+        Eliminates the impossible.
+
+        Returns: improved?
+        """
+        raise NotImplementedError
+
+    def solve(self) -> None:
+        """
+        Solves by elimination.
+        """
+        iteration = 0
+        while not self.solved():
+            log.debug(
+                f"Iteration {iteration}. "
+                f"Unsolved cells: {self.n_unknown_cells()}. "
+                f"Possible digit assignments: "
+                f"{self.n_possibilities_overall()} "
+                f"(target {self.n * self.n}). "
+                f"Possibilities:\n{self}")
+            improved = self.eliminate()
+            if not improved:
+                self.note("No improvement; guessing")
+                log.debug(f"Possibilities:\n{self}")
+                self.guess()
+            iteration += 1
+
+    # -------------------------------------------------------------------------
+    # Guessing
+    # -------------------------------------------------------------------------
+
+    def guess(self) -> None:
+        """
+        Implements the "guess" method!
+
+        Using this means that the algorithm has deficiencies (or the puzzle
+        does).
+        """
+        cls = self.__class__
+        for r in range(self.n):
+            for c in range(self.n):
+                digits = self.possible_digits(r, c)
+                if len(digits) == 1:
+                    continue
+                for d in digits:
+                    p = cls(self, n=self.n)  # type: CommonPossibilities
+                    p.guess_level = self.guess_level + 1
+                    log.warning("Guessing")
+                    p.assign_digit(r, c, d,
+                                   source=f"guess level {p.guess_level}")
+                    try:
+                        p.solve()
+                        assert p.solved()
+                        log.info(f"Guess level {p.guess_level} was good")
+                        self._assign_from_other(p)  # copy back from p
+                        return
+                    except SolutionFailure:
+                        log.info(
+                            f"Bad guess at level {p.guess_level}; moving on")
+
+    def _assign_from_other(self, other: "CommonPossibilities") -> None:
+        """
+        Copies another's attributes to self.
+        Used by guessing.
+        """
+        # no need to copy initial_values_zb
+        self.possible = deepcopy(other.possible)
+        self.working = deepcopy(other.working)

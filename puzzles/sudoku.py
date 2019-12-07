@@ -69,7 +69,7 @@ from cardinal_pythonlib.argparse_func import RawDescriptionArgumentDefaultsHelpF
 from cardinal_pythonlib.logs import main_only_quicksetup_rootlogger
 from mip import BINARY, Model, xsum
 
-from puzzles.common import (
+from common import (
     ALMOST_ONE,
     CommonPossibilities,
     debug_model_constraints,

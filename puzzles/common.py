@@ -117,6 +117,10 @@ class CommonPossibilities(object):
             # ... index as: self.possible[row_zb][col_zb][digit_zb]
             self.working = []  # type: List[str]
 
+    def clone(self) -> "CommonPossibilities":
+        # noinspection PyTypeChecker
+        return self.__class__(other=self, n=self.n)
+
     # -------------------------------------------------------------------------
     # Setup
     # -------------------------------------------------------------------------
@@ -459,7 +463,7 @@ class CommonPossibilities(object):
         """
         raise NotImplementedError
 
-    def solve(self) -> None:
+    def solve(self, no_guess: bool = False) -> None:
         """
         Solves by elimination.
         """
@@ -474,7 +478,9 @@ class CommonPossibilities(object):
                 f"Possibilities:\n{self}")
             improved = self.eliminate()
             if not improved:
-                self.note("No improvement; guessing")
+                if no_guess:
+                    raise ValueError("Would need to guess, but prohibited")
+                self.note("No improvement; need to guess")
                 log.debug(f"Possibilities:\n{self}")
                 self.guess()
             iteration += 1
@@ -490,14 +496,13 @@ class CommonPossibilities(object):
         Using this means that the algorithm has deficiencies (or the puzzle
         does).
         """
-        cls = self.__class__
         for r in range(self.n):
             for c in range(self.n):
                 digits = self.possible_digits(r, c)
                 if len(digits) == 1:
                     continue
                 for d in digits:
-                    p = cls(self, n=self.n)  # type: CommonPossibilities
+                    p = self.clone()
                     p.guess_level = self.guess_level + 1
                     log.warning("Guessing")
                     p.assign_digit(r, c, d,

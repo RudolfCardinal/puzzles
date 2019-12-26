@@ -477,7 +477,7 @@ class FutoshikiPossibilities(CommonPossibilities):
 
         return improved
 
-    def solve(self) -> None:
+    def solve(self, no_guess: bool = False) -> None:
         """
         Solves by elimination.
         """
@@ -494,11 +494,12 @@ class FutoshikiPossibilities(CommonPossibilities):
             if not improved:
                 self.note("No improvement; would need to guess")
                 log.debug(f"Possibilities:\n{self}")
+                if no_guess:
+                    msg = "Would need to guess, but prohibited"
+                    log.critical(msg)
+                    raise ValueError(msg)
                 self.guess()
             iteration += 1
-
-    def guess(self) -> None:
-        assert False, "Don't guess yet"
 
 
 # =============================================================================
@@ -766,7 +767,7 @@ class Futoshiki(object):
     # Solve via puzzle logic and show working
     # -------------------------------------------------------------------------
 
-    def solve_logic(self) -> None:
+    def solve_logic(self, no_guess: bool = False) -> None:
         """
         Solve via conventional logic, and save our working.
         """
@@ -795,7 +796,7 @@ class Futoshiki(object):
         )
 
         # Eliminate and iterate
-        p.solve()
+        p.solve(no_guess=no_guess)
 
         # Read out answers
         self.solved = True
@@ -844,6 +845,8 @@ def main() -> None:
         help="Solve from a file, via puzzle logic, showing working")
     parser_working.add_argument(
         "filename", type=str, default="", help=help_filename)
+    parser_working.add_argument(
+        "--noguess", action="store_true", help="Prevent guessing")
 
     _parser_demo = subparsers.add_parser(cmd_demo, help="Run demo")
 
@@ -867,7 +870,7 @@ def main() -> None:
         if args.command == cmd_solve:
             problem.solve()
         else:
-            problem.solve_logic()
+            problem.solve_logic(no_guess=args.noguess)
     log.info(f"Answer:\n{problem}")
     sys.exit(0)
 

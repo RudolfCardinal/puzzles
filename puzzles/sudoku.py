@@ -165,6 +165,9 @@ class SudokuPossibilities(CommonPossibilities):
         self.rank = rank
         super().__init__(other=other, n=n)
 
+    def clone(self) -> "SudokuPossibilities":
+        return self.__class__(other=self, rank=self.rank)
+
     # -------------------------------------------------------------------------
     # Setup
     # -------------------------------------------------------------------------
@@ -176,7 +179,10 @@ class SudokuPossibilities(CommonPossibilities):
         not zero-based.
         """
         super().set_initial_values(initial_values=initial_values)
-        n_distinct = len(set(x for x in initial_values if x is not None))
+        n_distinct = len(set(x
+                             for rowlist in initial_values
+                             for x in rowlist
+                             if x is not None))
         if n_distinct < self.n - 1:
             log.warning(
                 f"Not a well-formed Sudoku: {n_distinct} distinct initial "
@@ -728,7 +734,7 @@ class Sudoku(object):
     # Solve via puzzle logic and show working
     # -------------------------------------------------------------------------
 
-    def solve_logic(self) -> None:
+    def solve_logic(self, no_guess: bool = False) -> None:
         """
         Solve via conventional logic, and save our working.
         """
@@ -753,7 +759,7 @@ class Sudoku(object):
         p.set_initial_values(initial_values)
 
         # Eliminate and iterate
-        p.solve()
+        p.solve(no_guess=no_guess)
 
         # Read out answers
         self.solved = True
@@ -801,6 +807,8 @@ def main() -> None:
         help="Solve from a file, via puzzle logic, showing working")
     parser_working.add_argument(
         "filename", type=str, default="", help=help_filename)
+    parser_working.add_argument(
+        "--noguess", action="store_true", help="Prevent guessing")
 
     _parser_demo = subparsers.add_parser(cmd_demo, help="Run demo")
 
@@ -824,7 +832,7 @@ def main() -> None:
         if args.command == cmd_solve:
             problem.solve()
         else:
-            problem.solve_logic()
+            problem.solve_logic(no_guess=args.noguess)
     log.info(f"Answer:\n{problem}")
     sys.exit(0)
 

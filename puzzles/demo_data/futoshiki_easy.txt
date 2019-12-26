@@ -1,0 +1,11 @@
+# Random easy puzzle from https://www.futoshiki.org
+
+. . . .<4
+
+. .<. . .
+      ^
+. . . . .
+^     ^
+. . .>. .
+        v
+. .<. . .

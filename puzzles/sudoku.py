@@ -90,9 +90,6 @@ log = logging.getLogger(__name__)
 # Constants
 # =============================================================================
 
-N = 9
-T = 3
-
 DEMO_SUDOKU_1 = """
 # Coton 54, Coton Community News Dec 2019-Jan 2020
 
@@ -152,11 +149,21 @@ class SudokuPossibilities(CommonPossibilities):
         improvement in knowledge.
 
     """
-    def __init__(self, other: "SudokuPossibilities" = None) -> None:
+    def __init__(self, other: "SudokuPossibilities" = None,
+                 rank: int = 3) -> None:
         """
         Initialize with "everything is possible", or copy from another.
+
+        Args:
+            other:
+                other object to copy
+            rank:
+                rank of the puzzle (3 for normal 9x9 Sudoku)
+
         """
-        super().__init__(other=other, n=N)
+        n = rank ** 2
+        self.rank = rank
+        super().__init__(other=other, n=n)
 
     # -------------------------------------------------------------------------
     # Setup
@@ -169,28 +176,36 @@ class SudokuPossibilities(CommonPossibilities):
         not zero-based.
         """
         super().set_initial_values(initial_values=initial_values)
+        n_distinct = len(set(x for x in initial_values if x is not None))
+        if n_distinct < self.n - 1:
+            log.warning(
+                f"Not a well-formed Sudoku: {n_distinct} distinct initial "
+                f"values given, but need {self.n - 1} to be well-formed.")
+            # http://pi.math.cornell.edu/~mec/Summer2009/Mahmood/More.html
+            # Need (rank ^ 2 - 1) distinct values, i.e. (n - 1) values.
 
     # -------------------------------------------------------------------------
     # Visuals
     # -------------------------------------------------------------------------
 
-    @staticmethod
-    def _pstr_row_col(row_zb: int, col_zb: int, digit_zb: int) \
+    def _pstr_row_col(self, row_zb: int, col_zb: int, digit_zb: int) \
             -> Tuple[int, int]:
         """
         For __str__(): ``row, col`` (``y, x``) coordinates.
         """
-        x_base = col_zb * (T + 1)
-        y_base = row_zb * (T + 1)
-        x_offset = digit_zb % T
-        y_offset = digit_zb // T
+        t = self.rank
+        x_base = col_zb * (t + 1)
+        y_base = row_zb * (t + 1)
+        x_offset = digit_zb % t
+        y_offset = digit_zb // t
         return (y_base + y_offset), (x_base + x_offset)
 
     def __str__(self) -> str:
         """
         Returns a visual representation of possibilities.
         """
-        pn = N * 4 - 1
+        pn = self.n * 4 - 1
+        t = self.rank
 
         # Create grid of characters
         # BEWARE: DO NOT DO THIS: strings = [[" "] * pn] * pn
@@ -204,7 +219,7 @@ class SudokuPossibilities(CommonPossibilities):
             strings.append(line)
 
         # Prettify
-        cell_boundaries = ((T + 1) * T - 1, (T + 1) * (T * 2) - 1)
+        cell_boundaries = ((t + 1) * t - 1, (t + 1) * (t * 2) - 1)
         for r in cell_boundaries:
             for i in range(pn):
                 strings[r][i] = "-"
@@ -216,11 +231,11 @@ class SudokuPossibilities(CommonPossibilities):
                 strings[r][c] = "+"
 
         # Data
-        for r in range(N):
-            for c in range(N):
+        for r in range(self.n):
+            for c in range(self.n):
                 initial_value = self.initial_values_zb[r][c] is not None
                 cell_solved = self.n_possibilities(r, c) == 1
-                for d_zb in range(N):
+                for d_zb in range(self.n):
                     y, x = self._pstr_row_col(r, c, d_zb)
                     if self.possible[r][c][d_zb]:
                         txt = str(d_zb + 1)
@@ -237,40 +252,39 @@ class SudokuPossibilities(CommonPossibilities):
     # Calculation helpers
     # -------------------------------------------------------------------------
 
-    @staticmethod
-    def box_extremes_for_cell(row_zb: int, col_zb: int) \
+    def box_extremes_for_cell(self, row_zb: int, col_zb: int) \
             -> Tuple[int, int, int, int]:
         """
         Defines the boundaries of the 3x3 box containing a particular cell.
 
         Returns ``row_min, row_max, col_min, col_max``.
         """
-        row_min = (row_zb // T) * T
-        row_max = row_min + T - 1
-        col_min = (col_zb // T) * T
-        col_max = col_min + T - 1
+        t = self.rank
+        row_min = (row_zb // t) * t
+        row_max = row_min + t - 1
+        col_min = (col_zb // t) * t
+        col_max = col_min + t - 1
         return row_min, row_max, col_min, col_max
 
-    @staticmethod
-    def top_left_cell_for_box(box_zb: int) -> Tuple[int, int]:
+    def top_left_cell_for_box(self, box_zb: int) -> Tuple[int, int]:
         """
         Returns ``row_zb, col_zb`` for the top-left cell in a 3x3 box
         (numbered from 0 to N - 1).
         """
-        row = (box_zb // T) * T
-        col = (box_zb % T) * T
+        t = self.rank
+        row = (box_zb // t) * t
+        col = (box_zb % t) * t
         return row, col
 
-    @classmethod
-    def extremes_for_box(cls, box_zb: int) \
+    def extremes_for_box(self, box_zb: int) \
             -> Tuple[int, int, int, int]:
         """
         Defines the boundaries of the 3x3 box, numbered from 0 to (N - 1).
 
         Returns ``row_min, row_max, col_min, col_max``.
         """
-        row, col = cls.top_left_cell_for_box(box_zb)
-        return cls.box_extremes_for_cell(row, col)
+        row, col = self.top_left_cell_for_box(box_zb)
+        return self.box_extremes_for_cell(row, col)
 
     @staticmethod
     def box_description(box_zb: int) -> str:
@@ -331,8 +345,8 @@ class SudokuPossibilities(CommonPossibilities):
         log.debug("Eliminating, simple...")
         source = "eliminate_simple"
         improved = False
-        for row in range(N):
-            for col in range(N):
+        for row in range(self.n):
+            for col in range(self.n):
                 d_possible = self.possible_digits(row, col)
                 if len(d_possible) == 1:
                     d = d_possible[0]
@@ -351,11 +365,12 @@ class SudokuPossibilities(CommonPossibilities):
         assign it.
         """
         improved = False
-        for d in range(N):
+        for d in range(self.n):
             # Rows
             # Sudoku Snake: "Hidden Singles".
-            for r in range(N):
-                possible_cols = [c for c in range(N) if self.possible[r][c][d]]
+            for r in range(self.n):
+                possible_cols = [c for c in range(self.n)
+                                 if self.possible[r][c][d]]
                 if len(possible_cols) == 1:
                     source = (
                         f"Only possibility for digit {d + 1} in row {r + 1}")
@@ -363,8 +378,9 @@ class SudokuPossibilities(CommonPossibilities):
                         r, possible_cols[0], d, source=source) or improved
             # Columns
             # Sudoku Snake: "Hidden Singles".
-            for c in range(N):
-                possible_rows = [r for r in range(N) if self.possible[r][c][d]]
+            for c in range(self.n):
+                possible_rows = [r for r in range(self.n)
+                                 if self.possible[r][c][d]]
                 if len(possible_rows) == 1:
                     source = (
                         f"Only possibility for digit {d + 1} "
@@ -373,7 +389,7 @@ class SudokuPossibilities(CommonPossibilities):
                         possible_rows[0], c, d, source=source) or improved
             # Boxes
             # Sudoku Snake: "Hidden Singles By Box".
-            for b in range(N):
+            for b in range(self.n):
                 row_min, row_max, col_min, col_max = \
                     self.extremes_for_box(b)
                 possible_cells = [
@@ -402,12 +418,12 @@ class SudokuPossibilities(CommonPossibilities):
         # Sudoku Snake: "Pointing".
         log.debug(f"Eliminating, constraint-wise...")
         improved = False
-        for b in range(N):
+        for b in range(self.n):
             row_min, row_max, col_min, col_max = \
                 self.extremes_for_box(b)
             rownums = list(range(row_min, row_max + 1))
             colnums = list(range(col_min, col_max + 1))
-            for d in range(N):
+            for d in range(self.n):
                 source = (
                     f"eliminate_constraintwise from box {b + 1}, "
                     f"eliminating {d + 1}"
@@ -460,72 +476,16 @@ class SudokuPossibilities(CommonPossibilities):
         # Sudoku Snake: "Hidden Subsets" (restricting affected cells).
         # Sudoku Snake: "Naked Subsets" (eliminating from other cells).
         log.debug(f"Eliminating, groupwise, group size {groupsize}...")
-        improved = False
-        for digit_combo in combinations(range(N), r=groupsize):
+        improved = self._eliminate_groupwise_rows_cols(groupsize)
+        for digit_combo in combinations(range(self.n), r=groupsize):
             pretty_digits = [d + 1 for d in digit_combo]
-            source = f"eliminate_groupwise, digits={pretty_digits}"
-            # Rows
             combo_set = set(digit_combo)
-            for row in range(N):
-                columns_with_only_these_digits = [
-                    col for col in range(N)
-                    if combo_set.issubset(self.possible_digits(row, col))
-                ]
-                columns_with_any_of_these_digits = [
-                    col for col in range(N)
-                    if combo_set.intersection(self.possible_digits(row, col))
-                ]
-                if (len(columns_with_only_these_digits) == groupsize and
-                        len(columns_with_any_of_these_digits) == groupsize):
-                    prettycol = [c + 1 for c in columns_with_only_these_digits]
-                    log.debug(
-                        f"In row {row + 1}, only columns {prettycol} "
-                        f"could contain digits {pretty_digits}")
-                    improved = self._eliminate_from_row(
-                        row_zb=row,
-                        except_cols_zb=columns_with_only_these_digits,
-                        digits_zb_to_eliminate=digit_combo,
-                        source=source
-                    ) or improved
-                    improved = self._restrict_cells(
-                        cells=[(row, c)
-                               for c in columns_with_only_these_digits],
-                        digits_zb_to_keep=digit_combo,
-                        source=source
-                    ) or improved
-            # Columns
-            for col in range(N):
-                rows_with_only_these_digits = [
-                    row for row in range(N)
-                    if combo_set.issubset(self.possible_digits(row, col))
-                ]
-                rows_with_any_of_these_digits = [
-                    row for row in range(N)
-                    if combo_set.intersection(self.possible_digits(row, col))
-                ]
-                if (len(rows_with_only_these_digits) == groupsize and
-                        len(rows_with_any_of_these_digits) == groupsize):
-                    prettyrow = [r + 1 for r in rows_with_only_these_digits]
-                    log.debug(
-                        f"In column {col + 1}, only rows {prettyrow} "
-                        f"could contain digits {pretty_digits}")
-                    improved = self._eliminate_from_col(
-                        col_zb=col,
-                        except_rows_zb=rows_with_only_these_digits,
-                        digits_zb_to_eliminate=digit_combo,
-                        source=source
-                    ) or improved
-                    improved = self._restrict_cells(
-                        cells=[(r, col)
-                               for r in rows_with_only_these_digits],
-                        digits_zb_to_keep=digit_combo,
-                        source=source
-                    ) or improved
+            source = f"eliminate_groupwise, by box, digits={pretty_digits}"
             # Boxes
-            for box in range(N):
+            for box in range(self.n):
                 row_min, row_max, col_min, col_max = \
                     self.extremes_for_box(box)
-                cells_with_only_these_digits = [
+                cells_with_all_these_digits = [
                     (row, col)
                     for row in range(row_min, row_max + 1)
                     for col in range(col_min, col_max + 1)
@@ -537,21 +497,21 @@ class SudokuPossibilities(CommonPossibilities):
                     for col in range(col_min, col_max + 1)
                     if combo_set.intersection(self.possible_digits(row, col))
                 ]
-                if (len(cells_with_only_these_digits) == groupsize and
+                if (len(cells_with_all_these_digits) == groupsize and
                         len(cells_with_any_of_these_digits) == groupsize):
                     prettycell = [(r + 1, c+1)
-                                  for r, c in cells_with_only_these_digits]
+                                  for r, c in cells_with_all_these_digits]
                     log.debug(
                         f"In 3x3 box #{self.box_description(box)}, "
                         f"only cells {prettycell} "
                         f"could contain digits {pretty_digits}")
                     improved = self._eliminate_from_box(
-                        except_cells_zb=cells_with_only_these_digits,
+                        except_cells_zb=cells_with_all_these_digits,
                         digits_zb_to_eliminate=digit_combo,
                         source=source
                     ) or improved
                     improved = self._restrict_cells(
-                        cells=cells_with_only_these_digits,
+                        cells=cells_with_all_these_digits,
                         digits_zb_to_keep=digit_combo,
                         source=source
                     ) or improved
@@ -576,7 +536,7 @@ class SudokuPossibilities(CommonPossibilities):
         if improved:
             return improved  # Keep it simple...
 
-        for groupsize in range(2, N):  # from 2 to 8
+        for groupsize in range(2, self.n):  # from 2 to 8
             improved = self._eliminate_groupwise(groupsize) or improved
             if improved:
                 return improved
@@ -593,28 +553,32 @@ class Sudoku(object):
     Represents and solves Sudoku puzzles.
     """
 
-    def __init__(self, string_version: str) -> None:
+    def __init__(self, string_version: str, rank: int = 3) -> None:
         """
         Args:
             string_version:
                 String representation of the puzzle. Rules as below.
+            rank:
+                rank of the puzzle (3 for normal 9x9 Sudoku)
 
         - Initial/terminal blank lines are ignored
         - Use numbers 1-9 for known cells.
         - ``.`` represents an unknown cell.
         - one space (and one line) between each cell.
         """
+        self.rank = rank
+        self.n = rank ** 2
         # Create data structure
         self.solved = False
         self.problem_data = [
             [
-                UNKNOWN for _col_zb in range(N)
-            ] for _row_zb in range(N)
+                UNKNOWN for _col_zb in range(self.n)
+            ] for _row_zb in range(self.n)
         ]
         self.solution_data = [
             [
-                UNKNOWN for _col_zb in range(N)
-            ] for _row_zb in range(N)
+                UNKNOWN for _col_zb in range(self.n)
+            ] for _row_zb in range(self.n)
         ]
         self.working = []  # type: List[str]
 
@@ -628,19 +592,19 @@ class Sudoku(object):
 
         lines = ["".join(line.split())
                  for line in lines if line]  # remove blank lines/columns
-        if len(lines) != N:
-            raise ValueError(f"Must have {N} active lines; "
+        if len(lines) != self.n:
+            raise ValueError(f"Must have {self.n} active lines; "
                              f"found {len(lines)}, which are:\n"
                              f"{lines}")
 
         # Read user's input.
-        for row_zb in range(N):
+        for row_zb in range(self.n):
             line = lines[row_zb]
-            assert len(line) == N, (
-                f"Data line has wrong non-blank length: should be {N}, "
+            assert len(line) == self.n, (
+                f"Data line has wrong non-blank length: should be {self.n}, "
                 f"but is {len(line)} ({line!r})"
             )
-            for col_zb in range(N):
+            for col_zb in range(self.n):
                 self.problem_data[row_zb][col_zb] = line[col_zb]
 
     # -------------------------------------------------------------------------
@@ -662,18 +626,17 @@ class Sudoku(object):
         """
         return self._make_string(self.solution_data)
 
-    @staticmethod
-    def _make_string(data: List[List[str]]) -> str:
+    def _make_string(self, data: List[List[str]]) -> str:
         x = ""
-        for row_zb in range(N):
-            for col_zb in range(N):
+        for row_zb in range(self.n):
+            for col_zb in range(self.n):
                 # Cell, inequality, cell, inequality...
                 x += data[row_zb][col_zb]
-                if col_zb % T == 2:
+                if col_zb % self.rank == 2:
                     x += SPACE
-            if row_zb < N - 1:
+            if row_zb < self.n - 1:
                 x += NEWLINE
-                if row_zb % T == 2:
+                if row_zb % self.rank == 2:
                     x += NEWLINE
         return x
 
@@ -691,6 +654,8 @@ class Sudoku(object):
             return
 
         m = Model("Sudoku solver")
+        n = self.n
+        rank = self.rank
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Variables
@@ -700,39 +665,39 @@ class Sudoku(object):
                 [
                     m.add_var(f"x(row={r + 1}, col={c + 1}, digit={d + 1})",
                               var_type=BINARY)
-                    for d in range(N)
-                ] for c in range(N)
-            ] for r in range(N)
+                    for d in range(self.n)
+                ] for c in range(self.n)
+            ] for r in range(self.n)
         ]  # index as: x[row_zb][col_zb][digit_zb]
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Constraints
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # One digit per cell
-        for r in range(N):
-            for c in range(N):
-                m += xsum(x[r][c][d] for d in range(N)) == 1
-        for d in range(N):
+        for r in range(n):
+            for c in range(n):
+                m += xsum(x[r][c][d] for d in range(n)) == 1
+        for d in range(n):
             # One of each digit per row
-            for r in range(N):
-                m += xsum(x[r][c][d] for c in range(N)) == 1
+            for r in range(n):
+                m += xsum(x[r][c][d] for c in range(n)) == 1
             # One of each digit per column
-            for c in range(N):
-                m += xsum(x[r][c][d] for r in range(N)) == 1
+            for c in range(n):
+                m += xsum(x[r][c][d] for r in range(n)) == 1
         # One of each digit in each 3x3 box:
-        for d in range(N):
-            for box_row in range(T):
-                for box_col in range(T):
-                    row_base = box_row * T
-                    col_base = box_col * T
+        for d in range(n):
+            for box_row in range(rank):
+                for box_col in range(rank):
+                    row_base = box_row * rank
+                    col_base = box_col * rank
                     m += xsum(
                         x[row_base + row_offset][col_base + col_offset][d]
-                        for row_offset in range(T)
-                        for col_offset in range(T)
+                        for row_offset in range(rank)
+                        for col_offset in range(rank)
                     ) == 1
         # Starting values
-        for r in range(N):
-            for c in range(N):
+        for r in range(n):
+            for c in range(n):
                 if self.problem_data[r][c] != UNKNOWN:
                     d_zb = int(self.problem_data[r][c]) - 1
                     m += x[r][c][d_zb] == 1
@@ -750,9 +715,9 @@ class Sudoku(object):
         if m.num_solutions:
             self.solved = True
             self.working.append("Solved via integer programming method")
-            for r in range(N):
-                for c in range(N):
-                    for d_zb in range(N):
+            for r in range(n):
+                for c in range(n):
+                    for d_zb in range(n):
                         if x[r][c][d_zb].x > ALMOST_ONE:
                             self.solution_data[r][c] = str(d_zb + 1)
                             break
@@ -772,15 +737,16 @@ class Sudoku(object):
             return
 
         p = SudokuPossibilities()  # start from scratch
+        n = self.n
 
         # Set starting values.
         initial_values = [
             [
-                None for _c in range(N)
-            ] for _r in range(N)
+                None for _c in range(n)
+            ] for _r in range(n)
         ]  # type: List[List[Optional[int]]]
-        for r in range(N):
-            for c in range(N):
+        for r in range(n):
+            for c in range(n):
                 known_digit_str = self.problem_data[r][c]
                 if known_digit_str != UNKNOWN:
                     initial_values[r][c] = int(known_digit_str)
@@ -791,8 +757,8 @@ class Sudoku(object):
 
         # Read out answers
         self.solved = True
-        for r in range(N):
-            for c in range(N):
+        for r in range(n):
+            for c in range(n):
                 d_zb = next(i for i, v in enumerate(p.possible[r][c]) if v)
                 self.solution_data[r][c] = str(d_zb + 1)
 

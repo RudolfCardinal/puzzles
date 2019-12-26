@@ -119,6 +119,7 @@ class FutoshikiPossibilities(CommonPossibilities):
     # Setup
     # -------------------------------------------------------------------------
 
+    # noinspection PyMethodOverriding
     def set_initial_values(self,
                            initial_values: List[List[Optional[int]]],
                            inequalities_right: List[List[str]],
@@ -399,7 +400,7 @@ class FutoshikiPossibilities(CommonPossibilities):
                     self.iter_cells_greater_than(row, col)
                 ]
                 i_am_smaller_than = (
-                    max(max_of_bigger_cells) if max_of_bigger_cells
+                    min(max_of_bigger_cells) if max_of_bigger_cells
                     else self.n
                 )
                 min_of_smaller_cells = [
@@ -408,9 +409,11 @@ class FutoshikiPossibilities(CommonPossibilities):
                     self.iter_cells_less_than(row, col)
                 ]
                 i_am_bigger_than = (
-                    min(min_of_smaller_cells) if min_of_smaller_cells
+                    max(min_of_smaller_cells) if min_of_smaller_cells
                     else -1
                 )
+                if i_am_smaller_than == self.n and i_am_bigger_than == -1:
+                    continue  # nothing to do
                 # log.debug(
                 #     f"row={row + 1}, col={col + 1}: "
                 #     f"i_am_smaller_than={i_am_smaller_than + 1}, "
@@ -461,12 +464,16 @@ class FutoshikiPossibilities(CommonPossibilities):
         Returns: improved?
         """
         improved = self._eliminate_simple()
-        improved = self._eliminate_inequalities()
+        improved = self._eliminate_inequalities() or improved
         improved = self._find_only_possibilities() or improved
         if improved:
             return improved  # Keep it simple...
 
-        # *** more
+        for groupsize in range(2, self.n):
+            improved = self._eliminate_groupwise_rows_cols(
+                groupsize) or improved
+            if improved:
+                return improved
 
         return improved
 

@@ -27,6 +27,7 @@ Common constants and functions for the puzzle solvers.
 """
 
 from copy import deepcopy
+from itertools import combinations
 import logging
 from typing import List, Iterable, Optional, Sequence, Tuple
 
@@ -43,9 +44,9 @@ UNKNOWN = "."
 NEWLINE = "\n"
 SPACE = " "
 HASH = "#"
-DISPLAY_INITIAL = "■"
+DISPLAY_INITIAL = "♦"
 DISPLAY_UNKNOWN = "·"
-DISPLAY_SOLVED = "♦"
+DISPLAY_SOLVED = "■"
 ALMOST_ONE = 0.99
 
 
@@ -239,8 +240,8 @@ class CommonPossibilities(object):
         for row, col in cells:
             initial_n = self.n_possibilities(row, col)
             for d in range(self.n):
-                if d in digits_zb_to_keep:
-                    continue
+                if d not in digits_zb_to_keep:
+                    self.possible[row][col][d] = False
             final_n = self.n_possibilities(row, col)
             if final_n == 0:
                 raise SolutionFailure()
@@ -285,7 +286,8 @@ class CommonPossibilities(object):
             if c in except_cols_zb:
                 continue
             for d in digits_zb_to_eliminate:
-                zsource = f"{source}: eliminate_from_row, eliminating {d + 1}"
+                zsource = (f"{source}: Eliminating digit {d + 1} "
+                           f"from row {row_zb + 1}")
                 improved = self._eliminate_from_cell(
                     row_zb, c, d, source=zsource) or improved
         return improved
@@ -304,9 +306,145 @@ class CommonPossibilities(object):
             if r in except_rows_zb:
                 continue
             for d in digits_zb_to_eliminate:
-                zsource = f"{source}: eliminate_from_col, eliminating {d + 1}"
+                zsource = (f"{source}: Eliminating digit {d + 1} "
+                           f"from column {col_zb + 1}")
                 improved = self._eliminate_from_cell(
                     r, col_zb, d, source=zsource) or improved
+        return improved
+
+    def _eliminate_groupwise_rows_cols(self, groupsize: int) -> bool:
+        """
+        Scan through all numbers in groups of n. If there are exactly n
+        possible cells for each of those n numbers in a row/column/box, and
+        those possibilities are all the same, eliminate other possible digits
+        for those cells.
+
+        Returns: improved?
+
+        Example: in row 1, if digit 4 could be in columns 5/7 only, and digit 8
+        could be in columns 5/7 only, then either '4' goes in column 5 and '8'
+        goes in column 7, or vice versa - but these cells can't possibly
+        contain anything other than '4' or '8'.
+
+        That's an easy situation. We can illustrate it in more detail, e.g.
+        with six cells:
+
+        .. code-block:: none
+
+            <?>                 # Inference: cannot contain 4 or 8
+            4, 8    # Cell A
+            <?>                 # Inference: cannot contain 4 or 8
+            <?>                 # Inference: cannot contain 4 or 8
+            4, 8    # Cell B
+            <?>                 # Inference: cannot contain 4 or 8
+
+        Here, there are 2 cells with the same 2 possible values, and no other
+        cells can contain those values. The really obvious logic is:
+
+        - cell A must contain 4 or 8
+        - cell B must contain 4 or 8
+        - cell B must contain whichever of {4, 8} that cell A does not contain,
+          and vice versa
+        - no other cell can contain 4 or 8
+
+        There is a closely related but different inference to be made if the
+        cells in the set contain other values, but no other cells do:
+
+        .. code-block:: none
+
+            <not_4_not_8>
+            4, 8, 9             # Cell A. Inference: can only contain 4, 8.
+            <not_4_not_8>
+            <not_4_not_8>
+            4, 8                # Cell B. (Inference: can only contain 4, 8.)
+            <not_4_not_8>
+
+        Here, the logic is:
+
+        - there are only two locations for 4 and 8, and they are cells A and B;
+        - since there are only two locations for two digits, they must be in
+          those cells, and no other cells can contain them.
+
+        This can be combined into a single algorithm:
+
+        - If set {A, B, ...} of length n is present in n cells and no others,
+          then eliminate everything not in the set from those cells, and
+          everything in the set from all other cells.
+
+        To scale this up to larger set sizes... The situation where n=1 is part
+        of our basic elimination process, so our caller will begin with n=2. No
+        point going to n=9 (that means we have no information!) or n=8 (if 8
+        wholly uncertain digits, then 1 completely certain digit, and that
+        situation was dealt with earlier, in :meth:`_eliminate_simple`).
+
+        See also: http://pi.math.cornell.edu/~mec/Summer2009/Mahmood/Solve.html
+        """
+        # Sudoku Snake: "Hidden Subsets" (restricting affected cells).
+        # Sudoku Snake: "Naked Subsets" (eliminating from other cells).
+        log.debug(f"Eliminating, groupwise, group size {groupsize}...")
+        n = self.n
+        improved = False
+        for digit_combo in combinations(range(n), r=groupsize):
+            pretty_digits = [d + 1 for d in digit_combo]
+            combo_set = set(digit_combo)
+            # Rows
+            source = f"eliminate_groupwise, by row, digits={pretty_digits}"
+            for row in range(n):
+                columns_with_all_these_digits = [
+                    col for col in range(n)
+                    if combo_set.issubset(self.possible_digits(row, col))
+                ]
+                columns_with_any_of_these_digits = [
+                    col for col in range(n)
+                    if combo_set.intersection(self.possible_digits(row, col))
+                ]
+                if (len(columns_with_all_these_digits) == groupsize and
+                        len(columns_with_any_of_these_digits) == groupsize):
+                    prettycol = [c + 1 for c in columns_with_all_these_digits]
+                    log.info(
+                        f"In row {row + 1}, only columns {prettycol} "
+                        f"could contain digits {pretty_digits}")
+                    improved = self._eliminate_from_row(
+                        row_zb=row,
+                        except_cols_zb=columns_with_all_these_digits,
+                        digits_zb_to_eliminate=digit_combo,
+                        source=source
+                    ) or improved
+                    improved = self._restrict_cells(
+                        cells=[(row, c)
+                               for c in columns_with_all_these_digits],
+                        digits_zb_to_keep=digit_combo,
+                        source=source
+                    ) or improved
+            # Columns
+            source = f"eliminate_groupwise, by column, digits={pretty_digits}"
+            for col in range(n):
+                rows_with_all_these_digits = [
+                    row for row in range(n)
+                    if combo_set.issubset(self.possible_digits(row, col))
+                ]
+                rows_with_any_of_these_digits = [
+                    row for row in range(n)
+                    if combo_set.intersection(self.possible_digits(row, col))
+                ]
+                if (len(rows_with_all_these_digits) == groupsize and
+                        len(rows_with_any_of_these_digits) == groupsize):
+                    prettyrow = [r + 1 for r in rows_with_all_these_digits]
+                    log.info(
+                        f"In column {col + 1}, only rows {prettyrow} "
+                        f"could contain digits {pretty_digits}")
+                    improved = self._eliminate_from_col(
+                        col_zb=col,
+                        except_rows_zb=rows_with_all_these_digits,
+                        digits_zb_to_eliminate=digit_combo,
+                        source=source
+                    ) or improved
+                    improved = self._restrict_cells(
+                        cells=[(r, col)
+                               for r in rows_with_all_these_digits],
+                        digits_zb_to_keep=digit_combo,
+                        source=source
+                    ) or improved
         return improved
 
     # -------------------------------------------------------------------------

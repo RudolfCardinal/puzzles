@@ -63,7 +63,8 @@ import argparse
 from itertools import combinations
 import logging
 import sys
-from typing import Iterable, List, Optional, Tuple
+import traceback
+from typing import Generator, Iterable, List, Optional, Tuple
 
 from cardinal_pythonlib.argparse_func import RawDescriptionArgumentDefaultsHelpFormatter  # noqa
 from cardinal_pythonlib.logs import main_only_quicksetup_rootlogger
@@ -77,8 +78,11 @@ from common import (
     DISPLAY_INITIAL,
     DISPLAY_SOLVED,
     DISPLAY_UNKNOWN,
+    EXIT_SUCCESS,
+    EXIT_FAILURE,
     HASH,
     NEWLINE,
+    run_guard,
     SPACE,
     UNKNOWN,
 )
@@ -105,6 +109,203 @@ DEMO_SUDOKU_1 = """
 .91 4.5 6..
 ... ..9 ...
 """
+
+DEFAULT_RANK = 3
+
+
+# =============================================================================
+# Box
+# =============================================================================
+
+class Box(object):
+    """
+    Represents a 3x3 box within the Sudoku grid.
+    """
+    def __init__(self, box_zb: int, rank: int = DEFAULT_RANK) -> None:
+        """
+        Boxes are numbered 0 to N - 1. For a standard 9x9 (rank 3) Sudoku, with
+        3x3 boxes, they are numbered 0-8.
+
+        Args:
+            box_zb: box number, as above; zero-based
+        """
+        assert 0 <= box_zb < rank ** 2, (
+            f"box_zb was {box_zb}; must be in range 0 to {rank ** 2} inclusive"
+        )
+        self.rank = rank
+        self.box_zb = box_zb
+
+    def __str__(self) -> str:
+        """
+        Coordinate-based description for a 3x3 box.
+        """
+        return f"{{{self.boxrow + 1},{self.boxcol + 1}}}"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    @property
+    def boxrow(self) -> int:
+        """
+        Zero-based row number of the box (not its cells).
+        """
+        return self.box_zb // self.rank
+
+    @property
+    def boxcol(self) -> int:
+        """
+        Zero-based row number of the box (not its cells).
+        """
+        return self.box_zb % self.rank
+
+    def __eq__(self, other: "Box") -> bool:
+        """
+        Coordinate-based description for a 3x3 box.
+        """
+        return (
+            self.rank == other.rank and
+            self.box_zb == other.box_zb
+        )
+
+    def top_left_cell(self) -> Tuple[int, int]:
+        """
+        Returns ``row_zb, col_zb`` for the top-left cell in the 3x3 box
+        (numbered from 0 to N - 1).
+        """
+        t = self.rank
+        row = (self.box_zb // t) * t
+        col = (self.box_zb % t) * t
+        return row, col
+
+    def extremes(self) -> Tuple[int, int, int, int]:
+        """
+        Defines the boundaries of the 3x3 box, numbered from 0 to (N - 1).
+
+        Returns ``row_min, row_max, col_min, col_max``.
+        """
+        row_min, col_min = self.top_left_cell()
+        row_max = row_min + 2
+        col_max = col_min + 2
+        return row_min, row_max, col_min, col_max
+
+    @property
+    def row_min(self) -> int:
+        row_min, row_max, col_min, col_max = self.extremes()
+        return row_min
+
+    @property
+    def row_max(self) -> int:
+        row_min, row_max, col_min, col_max = self.extremes()
+        return row_max
+
+    @property
+    def col_min(self) -> int:
+        row_min, row_max, col_min, col_max = self.extremes()
+        return col_min
+
+    @property
+    def col_max(self) -> int:
+        row_min, row_max, col_min, col_max = self.extremes()
+        return col_max
+
+    @classmethod
+    def containing(cls, row_zb: int, col_zb: int,
+                   rank: int = DEFAULT_RANK) -> "Box":
+        """
+        Returns the box containing this cell.
+
+        Args:
+            row_zb: zero-based row number
+            col_zb: zero-based column number
+            rank: rank
+        """
+        t = rank
+        n = rank ** 2
+        assert 0 <= row_zb < n
+        assert 0 <= col_zb < n
+        boxrow = row_zb // t
+        boxcol = col_zb // t
+        return cls.from_boxrowcol(boxrow, boxcol, rank=rank)
+
+    @classmethod
+    def from_boxrowcol(cls, boxrow: int, boxcol: int,
+                       rank: int = DEFAULT_RANK) -> "Box":
+        """
+        Returns the box at this boxrow/boxcol.
+        """
+        assert 0 <= boxrow < rank
+        assert 0 <= boxcol < rank
+        box_zb = boxrow * rank + boxcol
+        return cls(box_zb=box_zb, rank=rank)
+
+    def gen_cells(self) -> Generator[Tuple[int, int], None, None]:
+        """
+        Generates ``(row_zb, col_zb)`` tuples for all the cells in this box.
+        """
+        row_min, row_max, col_min, col_max = self.extremes()
+        for r in range(row_min, row_max + 1):
+            for c in range(col_min, col_max + 1):
+                yield r, c
+
+    @property
+    def rownums(self) -> List[int]:
+        """
+        Row numbers (zero-based) covered by this box.
+        """
+        return list(range(self.row_min, self.row_max + 1))
+
+    @property
+    def colnums(self) -> List[int]:
+        """
+        Row numbers (zero-based) covered by this box.
+        """
+        return list(range(self.col_min, self.col_max + 1))
+
+    @property
+    def other_boxes_same_row(self) -> List["Box"]:
+        """
+        Other boxes with the same row number.
+        """
+        boxrow = self.boxrow
+        boxcol = self.boxcol
+        return [
+            self.from_boxrowcol(boxrow=boxrow, boxcol=c, rank=self.rank)
+            for c in range(self.rank)
+            if c != boxcol
+        ]
+
+    @property
+    def other_boxes_same_col(self) -> List["Box"]:
+        """
+        Other boxes with the same column number.
+        """
+        boxrow = self.boxrow
+        boxcol = self.boxcol
+        return [
+            self.from_boxrowcol(boxrow=r, boxcol=boxcol, rank=self.rank)
+            for r in range(self.rank)
+            if r != boxrow
+        ]
+
+    def gen_cells_other_boxes_same_row(self) \
+            -> Generator[Tuple[int, int], None, None]:
+        """
+        Generates ``(row, col)`` cell coordinates for boxes OTHER than this one
+        but in the same box row.
+        """
+        for box in self.other_boxes_same_row:
+            for r, c in box.gen_cells():
+                yield r, c
+
+    def gen_cells_other_boxes_same_col(self) \
+            -> Generator[Tuple[int, int], None, None]:
+        """
+        Generates ``(row, col)`` cell coordinates for boxes OTHER than this one
+        but in the same box row.
+        """
+        for box in self.other_boxes_same_col:
+            for r, c in box.gen_cells():
+                yield r, c
 
 
 # =============================================================================
@@ -150,7 +351,7 @@ class SudokuPossibilities(CommonPossibilities):
 
     """
     def __init__(self, other: "SudokuPossibilities" = None,
-                 rank: int = 3) -> None:
+                 rank: int = DEFAULT_RANK) -> None:
         """
         Initialize with "everything is possible", or copy from another.
 
@@ -255,53 +456,6 @@ class SudokuPossibilities(CommonPossibilities):
         return "\n".join("".join(x for x in line) for line in strings)
 
     # -------------------------------------------------------------------------
-    # Calculation helpers
-    # -------------------------------------------------------------------------
-
-    def box_extremes_for_cell(self, row_zb: int, col_zb: int) \
-            -> Tuple[int, int, int, int]:
-        """
-        Defines the boundaries of the 3x3 box containing a particular cell.
-
-        Returns ``row_min, row_max, col_min, col_max``.
-        """
-        t = self.rank
-        row_min = (row_zb // t) * t
-        row_max = row_min + t - 1
-        col_min = (col_zb // t) * t
-        col_max = col_min + t - 1
-        return row_min, row_max, col_min, col_max
-
-    def top_left_cell_for_box(self, box_zb: int) -> Tuple[int, int]:
-        """
-        Returns ``row_zb, col_zb`` for the top-left cell in a 3x3 box
-        (numbered from 0 to N - 1).
-        """
-        t = self.rank
-        row = (box_zb // t) * t
-        col = (box_zb % t) * t
-        return row, col
-
-    def extremes_for_box(self, box_zb: int) \
-            -> Tuple[int, int, int, int]:
-        """
-        Defines the boundaries of the 3x3 box, numbered from 0 to (N - 1).
-
-        Returns ``row_min, row_max, col_min, col_max``.
-        """
-        row, col = self.top_left_cell_for_box(box_zb)
-        return self.box_extremes_for_cell(row, col)
-
-    @staticmethod
-    def box_description(box_zb: int) -> str:
-        """
-        Coordinate-based description for a 3x3 box.
-        """
-        boxrow = box_zb // 3 + 1
-        boxcol = box_zb % 3 + 1
-        return f"[{boxrow},{boxcol}]"
-
-    # -------------------------------------------------------------------------
     # Computations
     # -------------------------------------------------------------------------
 
@@ -314,27 +468,24 @@ class SudokuPossibilities(CommonPossibilities):
 
         Returns: Improved?
         """
-        row_min, row_max, col_min, col_max = self.box_extremes_for_cell(
+        box = Box.containing(
             row_zb=min(t[0] for t in except_cells_zb),
-            col_zb=min(t[1] for t in except_cells_zb)
+            col_zb=min(t[1] for t in except_cells_zb),
+            rank=self.rank
         )
-        assert (row_min, row_max, col_min, col_max) == (
-            self.box_extremes_for_cell(
-                row_zb=max(t[0] for t in except_cells_zb),
-                col_zb=max(t[1] for t in except_cells_zb)
-            )
-        ), "except_cells_zb spans more than one 3x3 box!"
+        assert box == Box.containing(
+            row_zb=max(t[0] for t in except_cells_zb),
+            col_zb=max(t[1] for t in except_cells_zb),
+            rank=self.rank
+        ), "except_cells_zb spans more than one box!"
         improved = False
-        for r in range(row_min, row_max + 1):
-            for c in range(col_min, col_max + 1):
-                if (r, c) in except_cells_zb:
-                    continue
-                for d in digits_zb_to_eliminate:
-                    zsource = (
-                        f"{source}: eliminate_from_box, eliminating {d + 1}"
-                    )
-                    improved = self._eliminate_from_cell(
-                        r, c, d, source=zsource) or improved
+        for r, c in box.gen_cells():
+            if (r, c) in except_cells_zb:
+                continue
+            for d in digits_zb_to_eliminate:
+                zsource = f"{source}: eliminate_from_box, eliminating {d + 1}"
+                improved = self._eliminate_from_cell(
+                    r, c, d, source=zsource) or improved
         return improved
 
     # -------------------------------------------------------------------------
@@ -396,68 +547,109 @@ class SudokuPossibilities(CommonPossibilities):
             # Boxes
             # Sudoku Snake: "Hidden Singles By Box".
             for b in range(self.n):
-                row_min, row_max, col_min, col_max = \
-                    self.extremes_for_box(b)
+                box = Box(b)
                 possible_cells = [
                     (r, c)
-                    for r in range(row_min, row_max + 1)
-                    for c in range(col_min, col_max + 1)
+                    for r, c in box.gen_cells()
                     if self.possible[r][c][d]
                 ]
                 if len(possible_cells) == 1:
-                    source = (
-                        f"Only possibility for digit {d + 1} "
-                        f"in box {self.box_description(b)}")
+                    source = f"Only possibility for digit {d + 1} in box {b}"
                     improved = self.assign_digit(
                         possible_cells[0][0],
                         possible_cells[0][1], d, source=source) or improved
         return improved
 
-    def _eliminate_constraintwise(self) -> bool:
+    def _eliminate_boxwise(self) -> bool:
         """
-        Example: if we don't know where the 5 is in a particular 3x3 box,
-        but we know that it's in the first row, then we can eliminate "5" from
-        that row in all other cells.
+        The generalized rule:
+
+        - For each box in turn...
+
+        - For each digit in turn...
+
+        - Iterate through the (rank - 1) other boxes in a box row (or box
+          column).
+
+        - If a combination of x boxes permit only x rows (or columns) for the
+          digit (e.g. 1 box permits only one row, or 2 boxes permit only 2
+          rows), then our box cannot have that digit in those rows.
+
+        Example for a "single" box:
+
+            If we don't know where the 5 is in a particular 3x3 box, but we
+            know that it's in the first row, then we can eliminate "5" from
+            that row in all other boxes.
+
+        Example for a "pair" of boxes:
+
+            Consider the three boxes making up the left-hand column of boxes.
+            If the "5" digit can only be in columns 2 and 3 in the middle box,
+            and can only be in columns 2 and 3 in the bottom box, then it must
+            be in column 1 in the top box (and we can eliminate accordingly).
 
         Returns: improved?
+
+        Sudoku Snake terminology: "Pointing".
         """
-        # Sudoku Snake: "Pointing".
-        log.debug(f"Eliminating, constraint-wise...")
+        log.debug(f"Eliminating, box-wise...")
         improved = False
-        for b in range(self.n):
-            row_min, row_max, col_min, col_max = \
-                self.extremes_for_box(b)
-            rownums = list(range(row_min, row_max + 1))
-            colnums = list(range(col_min, col_max + 1))
-            for d in range(self.n):
-                source = (
-                    f"eliminate_constraintwise from box {b + 1}, "
-                    f"eliminating {d + 1}"
-                )
-                possible_cells_for_digit = [
-                    (r, c)
-                    for r in rownums
-                    for c in colnums
-                    if d in self.possible_digits(r, c)
-                ]
-                possible_rows = list(set(
-                    rc[0] for rc in possible_cells_for_digit))
-                possible_cols = list(set(
-                    rc[1] for rc in possible_cells_for_digit))
-                if len(possible_rows) == 1:
-                    improved = self._eliminate_from_row(
-                        row_zb=possible_rows[0],
-                        except_cols_zb=colnums,
-                        digits_zb_to_eliminate=[d],
-                        source=source
-                    ) or improved
-                if len(possible_cols) == 1:
-                    improved = self._eliminate_from_col(
-                        col_zb=possible_cols[0],
-                        except_rows_zb=rownums,
-                        digits_zb_to_eliminate=[d],
-                        source=source
-                    ) or improved
+        for groupsize in range(1, self.rank):  # 1 to rank - 1
+            # log.critical(f"boxwise: groupsize {groupsize}")
+            for b in range(self.n):
+                box = Box(b)
+                for d in range(self.n):
+                    # ---------------------------------------------------------
+                    # By row
+                    # ---------------------------------------------------------
+                    for box_combo in combinations(box.other_boxes_same_row,
+                                                  r=groupsize):
+                        possible_rows_other_boxes = set(
+                            r
+                            for otherbox in box_combo
+                            for r, c in otherbox.gen_cells()
+                            if d in self.possible_digits(r, c)
+                        )
+                        # log.critical(
+                        #     f"digit = {d + 1}; box = {box}; "
+                        #     f"box_combo = {box_combo}; "
+                        #     f"possible_rows_other_boxes = "
+                        #     f"{possible_rows_other_boxes}")
+                        if len(possible_rows_other_boxes) == groupsize:
+                            source = (
+                                f"eliminate_boxwise for digit {d + 1} in box "
+                                f"{box} with constraints from other boxes "
+                                f"{list(box_combo)} in the same row"
+                            )
+                            impossible_rows_this_box = possible_rows_other_boxes  # noqa
+                            for r in impossible_rows_this_box:
+                                for c in box.colnums:
+                                    improved = self._eliminate_from_cell(
+                                        r, c, d, source) or improved
+
+                    # ---------------------------------------------------------
+                    # By column
+                    # ---------------------------------------------------------
+                    for box_combo in combinations(box.other_boxes_same_col,
+                                                  r=groupsize):
+                        possible_cols_other_boxes = set(
+                            c
+                            for otherbox in box_combo
+                            for r, c in otherbox.gen_cells()
+                            if d in self.possible_digits(r, c)
+                        )
+                        if len(possible_cols_other_boxes) == groupsize:
+                            source = (
+                                f"eliminate_boxwise for digit {d + 1} in box "
+                                f"{box} with constraints from other boxes "
+                                f"{list(box_combo)} in the same column"
+                            )
+                            impossible_cols_this_box = possible_cols_other_boxes  # noqa
+                            for r in box.rownums:
+                                for c in impossible_cols_this_box:
+                                    improved = self._eliminate_from_cell(
+                                        r, c, d, source) or improved
+
         return improved
 
     def _eliminate_groupwise(self, groupsize: int) -> bool:
@@ -488,28 +680,24 @@ class SudokuPossibilities(CommonPossibilities):
             combo_set = set(digit_combo)
             source = f"eliminate_groupwise, by box, digits={pretty_digits}"
             # Boxes
-            for box in range(self.n):
-                row_min, row_max, col_min, col_max = \
-                    self.extremes_for_box(box)
+            for b in range(self.n):
+                box = Box(b, rank=self.rank)
                 cells_with_all_these_digits = [
-                    (row, col)
-                    for row in range(row_min, row_max + 1)
-                    for col in range(col_min, col_max + 1)
-                    if combo_set.issubset(self.possible_digits(row, col))
+                    (r, c)
+                    for r, c in box.gen_cells()
+                    if combo_set.issubset(self.possible_digits(r, c))
                 ]
                 cells_with_any_of_these_digits = [
-                    (row, col)
-                    for row in range(row_min, row_max + 1)
-                    for col in range(col_min, col_max + 1)
-                    if combo_set.intersection(self.possible_digits(row, col))
+                    (r, c)
+                    for r, c in box.gen_cells()
+                    if combo_set.intersection(self.possible_digits(r, c))
                 ]
                 if (len(cells_with_all_these_digits) == groupsize and
                         len(cells_with_any_of_these_digits) == groupsize):
                     prettycell = [(r + 1, c+1)
                                   for r, c in cells_with_all_these_digits]
-                    log.debug(
-                        f"In 3x3 box #{self.box_description(box)}, "
-                        f"only cells {prettycell} "
+                    self.note(
+                        f"In box {box}, only cells {prettycell} "
                         f"could contain digits {pretty_digits}")
                     improved = self._eliminate_from_box(
                         except_cells_zb=cells_with_all_these_digits,
@@ -538,7 +726,7 @@ class SudokuPossibilities(CommonPossibilities):
         if improved:
             return improved  # Keep it simple...
 
-        improved = self._eliminate_constraintwise()
+        improved = self._eliminate_boxwise()
         if improved:
             return improved  # Keep it simple...
 
@@ -559,7 +747,7 @@ class Sudoku(object):
     Represents and solves Sudoku puzzles.
     """
 
-    def __init__(self, string_version: str, rank: int = 3) -> None:
+    def __init__(self, string_version: str, rank: int = DEFAULT_RANK) -> None:
         """
         Args:
             string_version:
@@ -818,13 +1006,13 @@ def main() -> None:
 
     if not args.command:
         print("Must specify command")
-        sys.exit(1)
+        sys.exit(EXIT_FAILURE)
     if args.command == cmd_demo:
         problem = Sudoku(DEMO_SUDOKU_1)
         log.info(f"Solving:\n{problem}")
         problem.solve()
     else:
-        assert args.filename, "Must specify parameter: --filename"
+        log.info(f"Reading {args.filename}")
         with open(args.filename, "rt") as f:
             string_version = f.read()
         problem = Sudoku(string_version)
@@ -834,7 +1022,7 @@ def main() -> None:
         else:
             problem.solve_logic(no_guess=args.noguess)
     log.info(f"Answer:\n{problem}")
-    sys.exit(0)
+    sys.exit(EXIT_SUCCESS)
 
 
 # =============================================================================
@@ -842,8 +1030,4 @@ def main() -> None:
 # =============================================================================
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        log.critical(str(e))
-        raise
+    run_guard(main)

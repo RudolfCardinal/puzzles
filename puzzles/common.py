@@ -29,7 +29,9 @@ Common constants and functions for the puzzle solvers.
 from copy import deepcopy
 from itertools import combinations
 import logging
-from typing import List, Iterable, Optional, Sequence, Tuple
+import sys
+import traceback
+from typing import Callable, List, Iterable, Optional, Sequence, Tuple
 
 from mip import Constr, Model, Var
 
@@ -49,6 +51,8 @@ DISPLAY_UNKNOWN = "·"
 DISPLAY_SOLVED = "■"
 ALMOST_ONE = 0.99
 
+EXIT_FAILURE = 1
+EXIT_SUCCESS = 0
 
 # =============================================================================
 # Exceptions
@@ -80,6 +84,19 @@ def debug_model_vars(m: Model) -> None:
     for v in m.vars:  # type: Var
         lines.append(f"{v.name} == {v.x}")
     log.debug("\n".join(lines))
+
+
+# =============================================================================
+# Generic helper functions
+# =============================================================================
+
+def run_guard(function: Callable[[], None]) -> None:
+    try:
+        function()
+    except Exception as e:
+        log.critical(str(e))
+        traceback.print_exc()
+        sys.exit(EXIT_FAILURE)
 
 
 # =============================================================================
@@ -265,6 +282,8 @@ class CommonPossibilities(object):
         """
         if not self.possible[row_zb][col_zb][digit_zb]:
             return False
+        # log.critical(f"{source}: Eliminating {digit_zb + 1} "
+        #              f"from ({row_zb + 1},{col_zb + 1})")
         self.possible[row_zb][col_zb][digit_zb] = False
         n = self.n_possibilities(row_zb, col_zb)
         if n == 0:
@@ -391,7 +410,10 @@ class CommonPossibilities(object):
         for digit_combo in combinations(range(n), r=groupsize):
             pretty_digits = [d + 1 for d in digit_combo]
             combo_set = set(digit_combo)
+
+            # -----------------------------------------------------------------
             # Rows
+            # -----------------------------------------------------------------
             source = f"eliminate_groupwise, by row, digits={pretty_digits}"
             for row in range(n):
                 columns_with_all_these_digits = [
@@ -405,22 +427,27 @@ class CommonPossibilities(object):
                 if (len(columns_with_all_these_digits) == groupsize and
                         len(columns_with_any_of_these_digits) == groupsize):
                     prettycol = [c + 1 for c in columns_with_all_these_digits]
-                    log.info(
-                        f"In row {row + 1}, only columns {prettycol} "
-                        f"could contain digits {pretty_digits}")
-                    improved = self._eliminate_from_row(
+                    this_improved = self._eliminate_from_row(
                         row_zb=row,
                         except_cols_zb=columns_with_all_these_digits,
                         digits_zb_to_eliminate=digit_combo,
                         source=source
-                    ) or improved
-                    improved = self._restrict_cells(
+                    )
+                    this_improved = self._restrict_cells(
                         cells=[(row, c)
                                for c in columns_with_all_these_digits],
                         digits_zb_to_keep=digit_combo,
                         source=source
-                    ) or improved
+                    ) or this_improved
+                    if this_improved:
+                        self.note(
+                            f"In row {row + 1}, only columns {prettycol} "
+                            f"could contain digits {pretty_digits}")
+                    improved = improved or this_improved
+
+            # -----------------------------------------------------------------
             # Columns
+            # -----------------------------------------------------------------
             source = f"eliminate_groupwise, by column, digits={pretty_digits}"
             for col in range(n):
                 rows_with_all_these_digits = [
@@ -434,21 +461,24 @@ class CommonPossibilities(object):
                 if (len(rows_with_all_these_digits) == groupsize and
                         len(rows_with_any_of_these_digits) == groupsize):
                     prettyrow = [r + 1 for r in rows_with_all_these_digits]
-                    log.info(
-                        f"In column {col + 1}, only rows {prettyrow} "
-                        f"could contain digits {pretty_digits}")
-                    improved = self._eliminate_from_col(
+                    this_improved = self._eliminate_from_col(
                         col_zb=col,
                         except_rows_zb=rows_with_all_these_digits,
                         digits_zb_to_eliminate=digit_combo,
                         source=source
-                    ) or improved
-                    improved = self._restrict_cells(
+                    )
+                    this_improved = self._restrict_cells(
                         cells=[(r, col)
                                for r in rows_with_all_these_digits],
                         digits_zb_to_keep=digit_combo,
                         source=source
-                    ) or improved
+                    ) or this_improved
+                    if this_improved:
+                        self.note(
+                            f"In column {col + 1}, only rows {prettyrow} "
+                            f"could contain digits {pretty_digits}")
+                    improved = improved or this_improved
+
         return improved
 
     # -------------------------------------------------------------------------
@@ -466,6 +496,9 @@ class CommonPossibilities(object):
     def solve(self, no_guess: bool = False) -> None:
         """
         Solves by elimination.
+
+        Args:
+            no_guess: prohibit guessing
         """
         iteration = 0
         while not self.solved():
@@ -478,10 +511,12 @@ class CommonPossibilities(object):
                 f"Possibilities:\n{self}")
             improved = self.eliminate()
             if not improved:
-                if no_guess:
-                    raise ValueError("Would need to guess, but prohibited")
                 self.note("No improvement; need to guess")
-                log.debug(f"Possibilities:\n{self}")
+                if no_guess:
+                    log.info(f"Possibilities:\n{self}")
+                    raise ValueError("Would need to guess, but prohibited")
+                else:
+                    log.debug(f"Possibilities:\n{self}")
                 self.guess()
             iteration += 1
 

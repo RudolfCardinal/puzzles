@@ -35,6 +35,7 @@ from copy import deepcopy
 import logging
 import math
 import sys
+import traceback
 from typing import Generator, List, Optional, Tuple
 
 from cardinal_pythonlib.argparse_func import RawDescriptionArgumentDefaultsHelpFormatter  # noqa
@@ -49,8 +50,11 @@ from common import (
     DISPLAY_INITIAL,
     DISPLAY_SOLVED,
     DISPLAY_UNKNOWN,
+    EXIT_SUCCESS,
+    EXIT_FAILURE,
     HASH,
     NEWLINE,
+    run_guard,
     SPACE,
     UNKNOWN,
 )
@@ -477,30 +481,6 @@ class FutoshikiPossibilities(CommonPossibilities):
 
         return improved
 
-    def solve(self, no_guess: bool = False) -> None:
-        """
-        Solves by elimination.
-        """
-        iteration = 0
-        while not self.solved():
-            log.debug(
-                f"Iteration {iteration}. "
-                f"Unsolved cells: {self.n_unknown_cells()}. "
-                f"Possible digit assignments: "
-                f"{self.n_possibilities_overall()} "
-                f"(target {self.n * self.n}). "
-                f"Possibilities:\n{self}")
-            improved = self.eliminate()
-            if not improved:
-                self.note("No improvement; would need to guess")
-                log.debug(f"Possibilities:\n{self}")
-                if no_guess:
-                    msg = "Would need to guess, but prohibited"
-                    log.critical(msg)
-                    raise ValueError(msg)
-                self.guess()
-            iteration += 1
-
 
 # =============================================================================
 # Futoshiki
@@ -856,13 +836,13 @@ def main() -> None:
 
     if not args.command:
         print("Must specify command")
-        sys.exit(1)
+        sys.exit(EXIT_FAILURE)
     if args.command == cmd_demo:
         problem = Futoshiki(DEMO_FUTOSHIKI_1)
         log.info(f"Solving:\n{problem}")
         problem.solve()
     else:
-        assert args.filename, "Must specify parameter: --filename"
+        log.info(f"Reading {args.filename}")
         with open(args.filename, "rt") as f:
             string_version = f.read()
         problem = Futoshiki(string_version)
@@ -872,7 +852,7 @@ def main() -> None:
         else:
             problem.solve_logic(no_guess=args.noguess)
     log.info(f"Answer:\n{problem}")
-    sys.exit(0)
+    sys.exit(EXIT_SUCCESS)
 
 
 # =============================================================================
@@ -880,8 +860,4 @@ def main() -> None:
 # =============================================================================
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        log.critical(str(e))
-        raise
+    run_guard(main)

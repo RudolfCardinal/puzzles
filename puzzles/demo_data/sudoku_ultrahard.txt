@@ -62,7 +62,7 @@
 #  9. The value 1 in Box [3,3] must lie in Row 8.
 #  The value 1 in Box [1,1] must lie in Column 1.
 #  The cell (5,1) is one of 2 candidates for the value 9 in Row 5.
-#  10. The value 2 is the only candidate for the cell (5,4).
+#  10. The value 2 is the only candidate for the cell (5,4).                    # IS THAT A GUESS?
 #  11. The value 7 is the only candidate for the cell (6,5).
 #  12. The value 9 is the only candidate for the cell (4,5).
 #  13. The value 2 is the only candidate for the cell (2,5).

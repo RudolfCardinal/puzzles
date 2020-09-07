@@ -678,7 +678,7 @@ class Futoshiki(object):
         ]  # index as: x[row_zb][col_zb][digit_zb]
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Constraints
+        # Constraint helper functions
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         def implement_less_than(r1: int, c1: int, r2: int, c2: int) -> None:
             """
@@ -690,6 +690,9 @@ class Futoshiki(object):
                 <= xsum(x[r2][c2][d] * d for d in range(n)) - 1
             )
 
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Constraints
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # One digit per cell
         for r in range(n):
             for c in range(n):
